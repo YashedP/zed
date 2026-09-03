@@ -5235,6 +5235,112 @@ impl EditorElement {
         let line_height = layout.position_map.line_height;
         window.paint_layer(layout.gutter_hitbox.bounds, |window| {
             for (hunk, hitbox) in &layout.display_hunks {
+                if let DisplayDiffHunk::Unfolded {
+                    status,
+                    display_row_range,
+                    ..
+                } = hunk
+                    && let Some(hunk_hitbox) = hitbox
+                {
+                    let color = match split_side {
+                        Some(SplitSide::Left) => cx.theme().colors().version_control_deleted,
+                        Some(SplitSide::Right) => cx.theme().colors().version_control_added,
+                        None => match status.kind {
+                            DiffHunkStatusKind::Added => cx.theme().colors().version_control_added,
+                            DiffHunkStatusKind::Modified => {
+                                cx.theme().colors().version_control_modified
+                            }
+                            DiffHunkStatusKind::Deleted => {
+                                cx.theme().colors().version_control_deleted
+                            }
+                        },
+                    };
+                    let delegate = self.editor.read(cx).diff_hunk_delegate();
+                    let visible_start = display_row_range
+                        .start
+                        .max(layout.position_map.visible_row_range.start);
+                    let visible_end = display_row_range
+                        .end
+                        .min(layout.position_map.visible_row_range.end);
+                    let is_empty_deletion =
+                        status.kind == DiffHunkStatusKind::Deleted && display_row_range.is_empty();
+                    if !is_empty_deletion && visible_start >= visible_end {
+                        continue;
+                    }
+                    let mut row_infos = layout.position_map.snapshot.row_infos(visible_start);
+                    let first_row_info = row_infos.next();
+                    let first_override = first_row_info.as_ref().and_then(|row_info| {
+                        delegate.render_diff_row_hollow(
+                            status,
+                            row_info.buffer_id,
+                            row_info.buffer_row.or(row_info.wrapped_buffer_row),
+                            cx,
+                        )
+                    });
+                    if let Some(first_hollow) = first_override {
+                        let (segment_bounds, corner_radii) = if is_empty_deletion {
+                            (
+                                Bounds::new(
+                                    point(
+                                        hunk_hitbox.origin.x - hunk_hitbox.size.width,
+                                        hunk_hitbox.origin.y,
+                                    ),
+                                    size(hunk_hitbox.size.width * 2., hunk_hitbox.size.height),
+                                ),
+                                Corners::all(line_height),
+                            )
+                        } else {
+                            (hunk_hitbox.bounds, Corners::all(px(0.)))
+                        };
+                        let first_row_offset = visible_start.0 - display_row_range.start.0;
+                        let row_count = (visible_end.0 - visible_start.0).max(1);
+                        let mut segment_start = first_row_offset;
+                        let mut segment_hollow = first_hollow;
+                        for (row_offset, row_info) in row_infos
+                            .take(row_count.saturating_sub(1) as usize)
+                            .enumerate()
+                            .map(|(index, row_info)| {
+                                (first_row_offset + index as u32 + 1, row_info)
+                            })
+                        {
+                            let hollow = delegate
+                                .render_diff_row_hollow(
+                                    status,
+                                    row_info.buffer_id,
+                                    row_info.buffer_row.or(row_info.wrapped_buffer_row),
+                                    cx,
+                                )
+                                .unwrap_or(segment_hollow);
+                            if hollow != segment_hollow {
+                                Self::paint_gutter_diff_segment(
+                                    segment_bounds,
+                                    segment_start,
+                                    row_offset,
+                                    line_height,
+                                    color,
+                                    segment_hollow,
+                                    corner_radii,
+                                    window,
+                                    cx,
+                                );
+                                segment_start = row_offset;
+                                segment_hollow = hollow;
+                            }
+                        }
+                        Self::paint_gutter_diff_segment(
+                            segment_bounds,
+                            segment_start,
+                            first_row_offset + row_count,
+                            line_height,
+                            color,
+                            segment_hollow,
+                            corner_radii,
+                            window,
+                            cx,
+                        );
+                        continue;
+                    }
+                }
                 let hunk_to_paint = match hunk {
                     DisplayDiffHunk::Folded { .. } => {
                         let hunk_bounds = Self::diff_hunk_bounds(
@@ -5338,6 +5444,57 @@ impl EditorElement {
                 }
             }
         });
+    }
+
+    fn paint_gutter_diff_segment(
+        hunk_bounds: Bounds<Pixels>,
+        start_row: u32,
+        end_row: u32,
+        line_height: Pixels,
+        background_color: Hsla,
+        hollow: bool,
+        corner_radii: Corners<Pixels>,
+        window: &mut Window,
+        cx: &App,
+    ) {
+        let offset = start_row as f32 * line_height;
+        let available_height = (hunk_bounds.size.height - offset).max(px(0.));
+        let bounds = Bounds::new(
+            point(hunk_bounds.origin.x, hunk_bounds.origin.y + offset),
+            size(
+                hunk_bounds.size.width,
+                (end_row.saturating_sub(start_row) as f32 * line_height).min(available_height),
+            ),
+        );
+        let filled = cx
+            .theme()
+            .colors()
+            .editor_background
+            .blend(background_color);
+        if hollow {
+            let hollow_background = cx
+                .theme()
+                .colors()
+                .editor_background
+                .blend(background_color.opacity(0.3));
+            window.paint_quad(quad(
+                bounds,
+                corner_radii,
+                hollow_background,
+                Edges::all(px(1.0)),
+                filled,
+                BorderStyle::Solid,
+            ));
+        } else {
+            window.paint_quad(quad(
+                bounds,
+                corner_radii,
+                filled,
+                Edges::default(),
+                transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
     }
 
     fn gutter_strip_width(line_height: Pixels, cx: &App) -> Pixels {
@@ -6635,6 +6792,19 @@ impl EditorElement {
         );
 
         unstaged == unstaged_hollow
+    }
+
+    fn diff_row_hollow(
+        &self,
+        status: DiffHunkStatus,
+        buffer_id: Option<BufferId>,
+        buffer_row: Option<u32>,
+        cx: &mut App,
+    ) -> bool {
+        let delegate = self.editor.read(cx).diff_hunk_delegate();
+        delegate
+            .render_diff_row_hollow(&status, buffer_id, buffer_row, cx)
+            .unwrap_or_else(|| self.diff_hunk_hollow(status, buffer_id, cx))
     }
 
     #[cfg(debug_assertions)]
@@ -8324,12 +8494,16 @@ impl Element for EditorElement {
                             type_id: None,
                         };
 
-                        let background =
-                            if self.diff_hunk_hollow(diff_status, row_info.buffer_id, cx) {
-                                hollow_highlight
-                            } else {
-                                filled_highlight
-                            };
+                        let background = if self.diff_row_hollow(
+                            diff_status,
+                            row_info.buffer_id,
+                            row_info.buffer_row.or(row_info.wrapped_buffer_row),
+                            cx,
+                        ) {
+                            hollow_highlight
+                        } else {
+                            filled_highlight
+                        };
 
                         let base_display_point =
                             DisplayPoint::new(start_row + DisplayRow(ix as u32), 0);

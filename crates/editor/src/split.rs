@@ -253,6 +253,18 @@ impl DiffHunkDelegate for SplitLhsDiffHunkDelegate {
         let delegate = splittable.read(cx).rhs_editor.read(cx).diff_hunk_delegate();
         delegate.render_hunk_hollow(status, buffer_id, cx)
     }
+
+    fn render_diff_row_hollow(
+        &self,
+        status: &DiffHunkStatus,
+        buffer_id: Option<BufferId>,
+        buffer_row: Option<u32>,
+        cx: &App,
+    ) -> Option<bool> {
+        let splittable = self.splittable.upgrade()?;
+        let delegate = splittable.read(cx).rhs_editor.read(cx).diff_hunk_delegate();
+        delegate.render_diff_row_hollow(status, buffer_id, buffer_row, cx)
+    }
 }
 
 fn patches_for_range<F>(

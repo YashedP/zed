@@ -192,6 +192,23 @@ impl DiffHunkDelegate for BranchReviewDiffHunkDelegate {
         let path = review.read(cx).path_for_buffer(buffer_id?, cx)?;
         Some(review.read(cx).hunk_visual_state(&path, cx).hollow(status))
     }
+
+    fn render_diff_row_hollow(
+        &self,
+        status: &DiffHunkStatus,
+        buffer_id: Option<BufferId>,
+        buffer_row: Option<u32>,
+        cx: &App,
+    ) -> Option<bool> {
+        let review = self.review.upgrade()?;
+        let buffer_id = buffer_id?;
+        let path = review.read(cx).path_for_buffer(buffer_id, cx)?;
+        Some(
+            review
+                .read(cx)
+                .diff_row_hollow(&path, buffer_id, buffer_row?, status, cx),
+        )
+    }
 }
 
 impl BranchDiff {

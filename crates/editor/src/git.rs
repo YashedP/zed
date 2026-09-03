@@ -92,6 +92,16 @@ pub trait DiffHunkDelegate {
     ) -> Option<bool> {
         None
     }
+
+    fn render_diff_row_hollow(
+        &self,
+        _status: &DiffHunkStatus,
+        _buffer_id: Option<BufferId>,
+        _buffer_row: Option<u32>,
+        _cx: &App,
+    ) -> Option<bool> {
+        None
+    }
 }
 
 pub struct UncommittedDiffHunkDelegate;

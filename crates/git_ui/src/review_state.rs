@@ -496,6 +496,26 @@ impl ReviewState {
             .transpose()
     }
 
+    pub fn approved_snapshot_async(
+        &self,
+        path: &str,
+        cx: &App,
+    ) -> Task<Result<Option<SnapshotAvailability>>> {
+        if self.error.is_some() {
+            return Task::ready(Ok(None));
+        }
+        let Some(approval) = self.records.viewed.get(path) else {
+            return Task::ready(Ok(None));
+        };
+        let snapshot = approval.snapshot.clone();
+        cx.background_executor().spawn(async move {
+            match snapshot {
+                Some(snapshot) => snapshot.decode().map(Some),
+                None => Ok(Some(SnapshotAvailability::Legacy)),
+            }
+        })
+    }
+
     pub fn enrich_approval(
         &mut self,
         path: &str,
@@ -718,6 +738,32 @@ mod tests {
                 .unwrap()
                 .decode()
                 .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn approved_snapshot_async_decodes_persisted_comparison_off_the_caller(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let database = KeyValueStore::open_test_db("branch_review_async_snapshot").await;
+        let state = cx.new(|_| ReviewState::load("review".into(), database));
+        let approved = fingerprint("a", Some("base\r\n"), Some("viewed\r\n"));
+        state.update(cx, |state, cx| {
+            state.set_viewed(
+                "a".into(),
+                Some(approved),
+                Some((Some("base\r\n"), Some("viewed\r\n"))),
+                cx,
+            );
+        });
+
+        let task = state.read_with(cx, |state, cx| state.approved_snapshot_async("a", cx));
+        assert_eq!(
+            task.await.unwrap(),
+            Some(SnapshotAvailability::Available {
+                base: Some("base\r\n".into()),
+                current: Some("viewed\r\n".into()),
+            })
         );
     }
 

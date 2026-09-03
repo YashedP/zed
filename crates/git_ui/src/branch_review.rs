@@ -26,7 +26,9 @@ use project::{
 use settings::Settings;
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::Range,
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 use ui::{Checkbox, ElevationIndex, ToggleState, Tooltip, prelude::*};
@@ -71,6 +73,10 @@ struct ReviewEntry {
     validated_snapshot: Option<language::BufferSnapshot>,
     validated_base: Option<language::BufferSnapshot>,
     validated_comparison: Option<(Option<String>, Option<String>)>,
+    approved_current: Option<ApprovedCurrent>,
+    viewed_line_presentation: Option<ViewedLinePresentation>,
+    viewed_line_task: Option<Task<()>>,
+    content_edit_pending: bool,
     error: Option<String>,
     hash_generation: u64,
     changed: bool,
@@ -78,6 +84,95 @@ struct ReviewEntry {
     unresolved_threads: usize,
     _subscriptions: Vec<Subscription>,
     hash_task: Option<Task<()>>,
+}
+
+const CONTENT_EDIT_VALIDATION_DEBOUNCE: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+enum ApprovedCurrent {
+    Snapshot(language::BufferSnapshot),
+    Text(Option<Arc<str>>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewBufferSide {
+    Base,
+    Current,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ViewedLinePresentation {
+    base_rows_changed_when_viewed: Vec<Range<u32>>,
+    current_rows_changed_since_viewed: Vec<Range<u32>>,
+}
+
+impl ViewedLinePresentation {
+    fn new(base: Option<&str>, viewed: Option<&str>, current: Option<&str>) -> Self {
+        let base = base.unwrap_or_default();
+        let viewed = viewed.unwrap_or_default();
+        let current = current.unwrap_or_default();
+        Self {
+            base_rows_changed_when_viewed: language::line_diff(base, viewed)
+                .into_iter()
+                .map(|(base, _)| base)
+                .filter(|range| !range.is_empty())
+                .collect(),
+            current_rows_changed_since_viewed: language::line_diff(viewed, current)
+                .into_iter()
+                .map(|(_, current)| current)
+                .collect(),
+        }
+    }
+
+    fn row_is_hollow(
+        &self,
+        side: ReviewBufferSide,
+        row: u32,
+        status: &buffer_diff::DiffHunkStatus,
+    ) -> bool {
+        let range_affects_row = |ranges: &[Range<u32>], include_empty: bool| {
+            let index = ranges.partition_point(|range| range.start <= row);
+            index.checked_sub(1).is_some_and(|index| {
+                let range = &ranges[index];
+                range.contains(&row) || (include_empty && range.is_empty() && range.start == row)
+            })
+        };
+        match side {
+            ReviewBufferSide::Base => range_affects_row(&self.base_rows_changed_when_viewed, false),
+            ReviewBufferSide::Current => !range_affects_row(
+                &self.current_rows_changed_since_viewed,
+                status.kind == buffer_diff::DiffHunkStatusKind::Deleted,
+            ),
+        }
+    }
+
+    fn with_current_buffer_edits(
+        &self,
+        approved: &language::BufferSnapshot,
+        current: &language::BufferSnapshot,
+    ) -> Option<Self> {
+        if approved.remote_id() != current.remote_id() {
+            return None;
+        }
+        let current_rows_changed_since_viewed = current
+            .edits_since::<language::Point>(approved.version())
+            .map(|edit| {
+                let start = edit.new.start.row;
+                let end = if edit.new.start == edit.new.end {
+                    start.saturating_add(1)
+                } else if edit.new.end.column == 0 && edit.new.end.row > start {
+                    edit.new.end.row
+                } else {
+                    edit.new.end.row.saturating_add(1)
+                };
+                start..end
+            })
+            .collect();
+        Some(Self {
+            base_rows_changed_when_viewed: self.base_rows_changed_when_viewed.clone(),
+            current_rows_changed_since_viewed,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -154,11 +249,10 @@ impl ReviewHunkVisualState {
         }
     }
 
-    pub(crate) fn hollow(self, status: &buffer_diff::DiffHunkStatus) -> bool {
+    pub(crate) fn hollow(self, _status: &buffer_diff::DiffHunkStatus) -> bool {
         match self {
             Self::Hollow => true,
-            Self::Filled => false,
-            Self::Mixed => !status.has_secondary_hunk(),
+            Self::Filled | Self::Mixed => false,
         }
     }
 }
@@ -171,6 +265,7 @@ pub(crate) struct BranchReview {
     list: Entity<DiffBufferList>,
     entries: BTreeMap<RepoPath, ReviewEntry>,
     buffer_paths: HashMap<language::BufferId, RepoPath>,
+    buffer_sides: HashMap<language::BufferId, ReviewBufferSide>,
     pending_viewed: HashSet<RepoPath>,
     auto_folded_pending: HashSet<RepoPath>,
     startup_fold_state: Option<gpui::EntityId>,
@@ -239,6 +334,7 @@ impl BranchReview {
             list,
             entries: BTreeMap::new(),
             buffer_paths: HashMap::default(),
+            buffer_sides: HashMap::default(),
             pending_viewed: HashSet::default(),
             auto_folded_pending: HashSet::default(),
             startup_fold_state: None,
@@ -844,6 +940,8 @@ impl BranchReview {
             .collect();
         self.entries.retain(|path, _| paths.contains(path));
         self.buffer_paths.retain(|_, path| paths.contains(path));
+        self.buffer_sides
+            .retain(|buffer_id, _| self.buffer_paths.contains_key(buffer_id));
         self.pending_viewed.retain(|path| paths.contains(path));
         self.auto_folded_pending.retain(|path| paths.contains(path));
         for buffer in &buffers {
@@ -858,6 +956,10 @@ impl BranchReview {
                     validated_snapshot: None,
                     validated_base: None,
                     validated_comparison: None,
+                    approved_current: None,
+                    viewed_line_presentation: None,
+                    viewed_line_task: None,
+                    content_edit_pending: false,
                     error: None,
                     hash_generation: 0,
                     changed: true,
@@ -929,13 +1031,29 @@ impl BranchReview {
                                 let subscription = cx.subscribe(&loaded.main_buffer, {
                                     let path = path.clone();
                                     move |this, _, event, cx| {
-                                        if matches!(
+                                        if matches!(event, BufferEvent::Edited { .. }) {
+                                            if this.should_validate(&path, cx) {
+                                                if let Some(entry) = this.entries.get_mut(&path) {
+                                                    entry.content_edit_pending = true;
+                                                }
+                                                this.reconcile_after_content_edit(&path, cx);
+                                                this.refresh_viewed_line_presentation(&path, cx);
+                                                this.notify_diff_editors(cx);
+                                            }
+                                        } else if matches!(event, BufferEvent::Saved) {
+                                            if this.should_validate(&path, cx) {
+                                                if let Some(entry) = this.entries.get_mut(&path) {
+                                                    entry.content_edit_pending = true;
+                                                }
+                                                this.reconcile_immediately(&path, cx);
+                                            }
+                                        } else if matches!(
                                             event,
-                                            BufferEvent::Edited { .. }
-                                                | BufferEvent::FileHandleChanged
-                                                | BufferEvent::Reloaded
-                                                | BufferEvent::Saved
+                                            BufferEvent::FileHandleChanged | BufferEvent::Reloaded
                                         ) {
+                                            if let Some(entry) = this.entries.get_mut(&path) {
+                                                entry.content_edit_pending = false;
+                                            }
                                             if this.should_validate(&path, cx) {
                                                 this.reconcile(&path, cx);
                                             }
@@ -946,7 +1064,12 @@ impl BranchReview {
                                     let path = path.clone();
                                     move |this, _, _, cx| {
                                         this.update_diff_stat(&path, cx);
-                                        if this.should_validate(&path, cx) {
+                                        if this.should_validate(&path, cx)
+                                            && this
+                                                .entries
+                                                .get(&path)
+                                                .is_some_and(|entry| !entry.content_edit_pending)
+                                        {
                                             this.reconcile(&path, cx)
                                         }
                                     }
@@ -956,6 +1079,9 @@ impl BranchReview {
                                 let buffer_id = loaded.main_buffer.read(cx).remote_id();
                                 let base_buffer_id = loaded.diff.read(cx).base_text(cx).remote_id();
                                 this.buffer_paths.retain(|_, candidate| candidate != &path);
+                                this.buffer_sides.retain(|buffer_id, _| {
+                                    this.buffer_paths.contains_key(buffer_id)
+                                });
                                 if let Some(entry) = this.entries.get_mut(&path) {
                                     entry.status = buffer.file_status;
                                     entry.buffer = Some(loaded.main_buffer);
@@ -966,6 +1092,10 @@ impl BranchReview {
                                 }
                                 this.buffer_paths.insert(buffer_id, path.clone());
                                 this.buffer_paths.insert(base_buffer_id, path.clone());
+                                this.buffer_sides
+                                    .insert(buffer_id, ReviewBufferSide::Current);
+                                this.buffer_sides
+                                    .insert(base_buffer_id, ReviewBufferSide::Base);
                                 if this.should_validate(&path, cx) {
                                     this.reconcile(&path, cx);
                                 }
@@ -1025,6 +1155,18 @@ impl BranchReview {
 
     #[ztracing::instrument(skip_all, fields(path = %path))]
     fn reconcile(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
+        self.reconcile_with_delay(path, Duration::from_millis(50), cx);
+    }
+
+    fn reconcile_after_content_edit(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
+        self.reconcile_with_delay(path, CONTENT_EDIT_VALIDATION_DEBOUNCE, cx);
+    }
+
+    fn reconcile_immediately(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
+        self.reconcile_with_delay(path, Duration::ZERO, cx);
+    }
+
+    fn reconcile_with_delay(&mut self, path: &RepoPath, delay: Duration, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.get_mut(path) else {
             return;
         };
@@ -1066,10 +1208,8 @@ impl BranchReview {
         let expected_base = base.clone();
         let path = path.clone();
         entry.hash_task = Some(cx.spawn(async move |this, cx| {
-            if !approving {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
+            if !approving && !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
             }
             let result = async {
                 let metadata = fs.metadata(&abs_path).await?;
@@ -1138,6 +1278,7 @@ impl BranchReview {
                     return;
                 }
                 let mut pending_approval = None;
+                let mut refresh_presentation = false;
                 if let Some(entry) = this.entries.get_mut(&path) {
                     if entry.hash_generation != hash_generation {
                         return;
@@ -1151,6 +1292,7 @@ impl BranchReview {
                     }) {
                         return;
                     }
+                    entry.content_edit_pending = false;
                     match result {
                         Ok((fingerprint, changed, base, current)) => {
                             if let Some(state) = &this.state {
@@ -1174,6 +1316,7 @@ impl BranchReview {
                             entry.validated_comparison = Some((base, current));
                             entry.changed = changed;
                             entry.error = None;
+                            refresh_presentation = true;
                         }
                         Err(error) => {
                             let was_pending = this.pending_viewed.remove(&path);
@@ -1203,7 +1346,147 @@ impl BranchReview {
                         )
                     });
                 }
+                if refresh_presentation {
+                    this.refresh_viewed_line_presentation(&path, cx);
+                }
                 this.schedule_rebuild(cx);
+                this.notify_diff_editors(cx);
+            })
+            .log_err();
+        }));
+    }
+
+    fn refresh_viewed_line_presentation(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
+        let visual_state = self.hunk_visual_state(path, cx);
+        let state = self.state.clone();
+        let Some(entry) = self.entries.get_mut(path) else {
+            return;
+        };
+        if visual_state == ReviewHunkVisualState::Filled {
+            entry.viewed_line_presentation = None;
+            entry.viewed_line_task = None;
+            return;
+        }
+        if visual_state == ReviewHunkVisualState::Hollow {
+            entry.approved_current = entry
+                .validated_snapshot
+                .clone()
+                .map(ApprovedCurrent::Snapshot);
+        }
+        let Some((base, current)) = entry.validated_comparison.clone() else {
+            entry.viewed_line_task = None;
+            return;
+        };
+        let Some(current_snapshot) = entry
+            .buffer
+            .as_ref()
+            .map(|buffer| buffer.read(cx).snapshot())
+        else {
+            entry.viewed_line_task = None;
+            return;
+        };
+        let current_exists = current.is_some();
+        let generation = self.generation;
+        let hash_generation = entry.hash_generation;
+        if current_exists
+            && let Some(ApprovedCurrent::Snapshot(approved)) = &entry.approved_current
+            && let Some(presentation) =
+                entry
+                    .viewed_line_presentation
+                    .as_ref()
+                    .and_then(|presentation| {
+                        presentation.with_current_buffer_edits(approved, &current_snapshot)
+                    })
+        {
+            entry.viewed_line_presentation = Some(presentation);
+            entry.viewed_line_task = None;
+            return;
+        }
+        let snapshot_task = match entry.approved_current.clone() {
+            Some(ApprovedCurrent::Snapshot(snapshot)) => {
+                cx.background_executor().spawn(async move {
+                    let current = if snapshot.line_ending() == language::LineEnding::Windows {
+                        snapshot.text().replace('\n', "\r\n")
+                    } else {
+                        snapshot.text()
+                    };
+                    Ok(Some(SnapshotAvailability::Available {
+                        base: None,
+                        current: Some(current),
+                    }))
+                })
+            }
+            Some(ApprovedCurrent::Text(current)) => {
+                Task::ready(Ok(Some(SnapshotAvailability::Available {
+                    base: None,
+                    current: current.as_deref().map(str::to_owned),
+                })))
+            }
+            None => match state.as_ref() {
+                Some(state) => state
+                    .read(cx)
+                    .approved_snapshot_async(&path.to_string(), cx),
+                None => {
+                    entry.viewed_line_task = None;
+                    return;
+                }
+            },
+        };
+        let path = path.clone();
+        entry.viewed_line_task = Some(cx.spawn(async move |this, cx| {
+            let approved_current = match snapshot_task.await {
+                Ok(Some(SnapshotAvailability::Available { current, .. })) => current,
+                Ok(Some(SnapshotAvailability::TooLarge | SnapshotAvailability::Legacy))
+                | Ok(None) => return,
+                Err(error) => {
+                    log::error!(
+                        "Unable to restore Viewed line presentation for {}: {error:#}",
+                        path.as_unix_str()
+                    );
+                    return;
+                }
+            };
+            let presentation = cx
+                .background_spawn({
+                    let base = base.clone();
+                    let approved_current = approved_current.clone();
+                    async move {
+                        let current = current_exists.then(|| {
+                            if current_snapshot.line_ending() == language::LineEnding::Windows {
+                                current_snapshot.text().replace('\n', "\r\n")
+                            } else {
+                                current_snapshot.text()
+                            }
+                        });
+                        ViewedLinePresentation::new(
+                            base.as_deref(),
+                            approved_current.as_deref(),
+                            current.as_deref(),
+                        )
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation
+                    || matches!(
+                        this.hunk_visual_state(&path, cx),
+                        ReviewHunkVisualState::Filled
+                    )
+                {
+                    return;
+                }
+                let Some(entry) = this.entries.get_mut(&path) else {
+                    return;
+                };
+                if entry.hash_generation != hash_generation {
+                    return;
+                }
+                if !matches!(entry.approved_current, Some(ApprovedCurrent::Snapshot(_))) {
+                    entry.approved_current = Some(ApprovedCurrent::Text(
+                        approved_current.as_deref().map(Arc::from),
+                    ));
+                }
+                entry.viewed_line_presentation = Some(presentation);
                 this.notify_diff_editors(cx);
             })
             .log_err();
@@ -1312,11 +1595,49 @@ impl BranchReview {
     }
 
     pub(crate) fn hunk_visual_state(&self, path: &RepoPath, cx: &App) -> ReviewHunkVisualState {
+        if !self.is_viewed_delta(cx)
+            && self
+                .entries
+                .get(path)
+                .is_some_and(|entry| entry.content_edit_pending)
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.read(cx).has_approval(&path.to_string()))
+        {
+            return ReviewHunkVisualState::Mixed;
+        }
         ReviewHunkVisualState::classify(
             self.is_viewed_delta(cx),
             self.is_viewed(path, cx),
             &self.change_reasons(path, cx),
         )
+    }
+
+    pub(crate) fn diff_row_hollow(
+        &self,
+        path: &RepoPath,
+        buffer_id: language::BufferId,
+        buffer_row: u32,
+        status: &buffer_diff::DiffHunkStatus,
+        cx: &App,
+    ) -> bool {
+        match self.hunk_visual_state(path, cx) {
+            ReviewHunkVisualState::Hollow => true,
+            ReviewHunkVisualState::Filled => false,
+            ReviewHunkVisualState::Mixed => {
+                let Some(entry) = self.entries.get(path) else {
+                    return false;
+                };
+                self.buffer_sides
+                    .get(&buffer_id)
+                    .zip(entry.viewed_line_presentation.as_ref())
+                    .map(|(side, presentation)| {
+                        presentation.row_is_hollow(*side, buffer_row, status)
+                    })
+                    .unwrap_or(entry.content_edit_pending && entry.approved_current.is_some())
+            }
+        }
     }
 
     pub(crate) fn viewed_control_state(
@@ -1710,7 +2031,7 @@ impl BranchReview {
         } else {
             self.pending_viewed.insert(path.clone());
             if loaded {
-                self.reconcile(path, cx);
+                self.reconcile_immediately(path, cx);
             }
         }
         ViewedTransition::MarkingViewed
@@ -1739,6 +2060,16 @@ impl BranchReview {
 
         let mut changed = false;
         for (path, transition, was_pending, newly_pending) in transitions {
+            if transition != ViewedTransition::NoChange {
+                if viewed {
+                    self.refresh_viewed_line_presentation(path, cx);
+                } else if let Some(entry) = self.entries.get_mut(path) {
+                    entry.approved_current = None;
+                    entry.viewed_line_presentation = None;
+                    entry.viewed_line_task = None;
+                    entry.content_edit_pending = false;
+                }
+            }
             if viewed
                 && collapse_newly_viewed
                 && (newly_pending
@@ -2688,12 +3019,256 @@ mod tests {
             ] {
                 assert!(ReviewHunkVisualState::Hollow.hollow(&hunk));
                 assert!(!ReviewHunkVisualState::Filled.hollow(&hunk));
-                assert_eq!(
-                    ReviewHunkVisualState::Mixed.hollow(&hunk),
-                    !hunk.has_secondary_hunk()
-                );
+                assert!(!ReviewHunkVisualState::Mixed.hollow(&hunk));
             }
         }
+    }
+
+    #[test]
+    fn viewed_line_presentation_separates_reviewed_and_subsequent_rows() {
+        let modified_hunk = buffer_diff::DiffHunkStatus::modified_none();
+        let modified = ViewedLinePresentation::new(
+            Some("before\n"),
+            Some("reviewed one\nreviewed two\n"),
+            Some("reviewed one\nreviewed two\nnew after review\n"),
+        );
+        assert!(modified.row_is_hollow(ReviewBufferSide::Base, 0, &modified_hunk));
+        assert!(modified.row_is_hollow(ReviewBufferSide::Current, 0, &modified_hunk));
+        assert!(modified.row_is_hollow(ReviewBufferSide::Current, 1, &modified_hunk));
+        assert!(!modified.row_is_hollow(ReviewBufferSide::Current, 2, &modified_hunk));
+
+        let added = ViewedLinePresentation::new(
+            None,
+            Some("first\nsecond\n"),
+            Some("first\nsecond\nthird"),
+        );
+        assert!(added.row_is_hollow(ReviewBufferSide::Current, 0, &modified_hunk));
+        assert!(added.row_is_hollow(ReviewBufferSide::Current, 1, &modified_hunk));
+        assert!(!added.row_is_hollow(ReviewBufferSide::Current, 2, &modified_hunk));
+
+        let deleted_after_review = ViewedLinePresentation::new(
+            Some("base changed when viewed\nremoved later\n"),
+            Some("reviewed replacement\nremoved later\n"),
+            Some("reviewed replacement\n"),
+        );
+        assert!(deleted_after_review.row_is_hollow(ReviewBufferSide::Base, 0, &modified_hunk));
+        assert!(!deleted_after_review.row_is_hollow(ReviewBufferSide::Base, 1, &modified_hunk));
+        assert!(!deleted_after_review.row_is_hollow(
+            ReviewBufferSide::Current,
+            1,
+            &buffer_diff::DiffHunkStatus::deleted_none(),
+        ));
+    }
+
+    #[gpui::test]
+    async fn viewed_rows_stay_stable_for_modified_and_branch_added_files(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {"logs": {"refs": {"heads": {"review": "branch created\n"}}}},
+                "README.md": "base\nreviewed line\n",
+                "alpha.txt": "first\nsecond\nthird\n"
+            }),
+        )
+        .await;
+        let git_dir = Path::new(path!("/project/.git"));
+        fs.set_branch_name(git_dir, Some("review"));
+        fs.set_head_and_index_for_repo(
+            git_dir,
+            &[
+                ("README.md", "base\nreviewed line\n".into()),
+                ("alpha.txt", "first\nsecond\nthird\n".into()),
+            ],
+        );
+        fs.set_merge_base_content_for_repo(git_dir, &[("README.md", "base\n".into())]);
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project, workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(100));
+        }
+        cx.run_until_parked();
+
+        let readme = RepoPath::new("README.md").unwrap();
+        let alpha = RepoPath::new("alpha.txt").unwrap();
+        diff.read_with(cx, |diff, _| diff.review.clone())
+            .update(cx, |review, cx| {
+                review.toggle_viewed(&readme, cx);
+                review.toggle_viewed(&alpha, cx);
+            });
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            assert!(review.is_viewed(&readme, cx));
+            assert!(review.is_viewed(&alpha, cx));
+            assert!(review.entries[&readme].viewed_line_presentation.is_some());
+            assert!(review.entries[&alpha].viewed_line_presentation.is_some());
+        });
+        let (readme_buffer, alpha_buffer) = diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            (
+                review.entries[&readme].buffer.as_ref().unwrap().clone(),
+                review.entries[&alpha].buffer.as_ref().unwrap().clone(),
+            )
+        });
+
+        readme_buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "new after view\n")], None, cx);
+        });
+        alpha_buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "aaaaa")], None, cx);
+        });
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert_eq!(
+                review.hunk_visual_state(&readme, cx),
+                ReviewHunkVisualState::Mixed
+            );
+            assert!(review.entries[&readme].content_edit_pending);
+            assert!(review.entries[&readme].viewed_line_task.is_none());
+            assert!(review.entries[&alpha].content_edit_pending);
+            assert!(review.entries[&alpha].viewed_line_task.is_none());
+            assert!(review.diff_row_hollow(
+                &readme,
+                readme_buffer.read(cx).remote_id(),
+                1,
+                &hunk,
+                cx,
+            ));
+            assert!(!review.diff_row_hollow(
+                &readme,
+                readme_buffer.read(cx).remote_id(),
+                2,
+                &hunk,
+                cx,
+            ));
+            assert!(review.diff_row_hollow(
+                &alpha,
+                alpha_buffer.read(cx).remote_id(),
+                2,
+                &hunk,
+                cx,
+            ));
+            assert!(!review.diff_row_hollow(
+                &alpha,
+                alpha_buffer.read(cx).remote_id(),
+                3,
+                &hunk,
+                cx,
+            ));
+        });
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        readme_buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "more")], None, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            let entry = &review.entries[&readme];
+            assert!(entry.content_edit_pending);
+            assert_ne!(
+                entry.validated_snapshot.as_ref().unwrap().version(),
+                readme_buffer.read(cx).snapshot().version(),
+                "rapid typing must restart the trailing validation debounce"
+            );
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert!(review.diff_row_hollow(
+                &readme,
+                readme_buffer.read(cx).remote_id(),
+                1,
+                &hunk,
+                cx,
+            ));
+            assert!(!review.diff_row_hollow(
+                &readme,
+                readme_buffer.read(cx).remote_id(),
+                2,
+                &hunk,
+                cx,
+            ));
+        });
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            let readme_id = readme_buffer.read(cx).remote_id();
+            let alpha_id = alpha_buffer.read(cx).remote_id();
+            assert_eq!(
+                review.hunk_visual_state(&readme, cx),
+                ReviewHunkVisualState::Mixed
+            );
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert!(review.diff_row_hollow(&readme, readme_id, 1, &hunk, cx));
+            assert!(!review.diff_row_hollow(&readme, readme_id, 2, &hunk, cx));
+            assert!(review.diff_row_hollow(&alpha, alpha_id, 0, &hunk, cx));
+            assert!(review.diff_row_hollow(&alpha, alpha_id, 2, &hunk, cx));
+            assert!(!review.diff_row_hollow(&alpha, alpha_id, 3, &hunk, cx));
+        });
+
+        alpha_buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end - 1..end, "")], None, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            let alpha_id = alpha_buffer.read(cx).remote_id();
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert!(review.diff_row_hollow(&alpha, alpha_id, 2, &hunk, cx));
+            assert!(!review.diff_row_hollow(&alpha, alpha_id, 3, &hunk, cx));
+        });
+
+        alpha_buffer.update(cx, |buffer, cx| {
+            buffer.undo(cx);
+            buffer.undo(cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        diff.read_with(cx, |diff, cx| {
+            assert_eq!(
+                diff.review.read(cx).hunk_visual_state(&alpha, cx),
+                ReviewHunkVisualState::Hollow
+            );
+        });
+
+        alpha_buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "again")], None, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        diff.read_with(cx, |diff, cx| {
+            let review = diff.review.read(cx);
+            let alpha_id = alpha_buffer.read(cx).remote_id();
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert!(review.diff_row_hollow(&alpha, alpha_id, 2, &hunk, cx));
+            assert!(!review.diff_row_hollow(&alpha, alpha_id, 3, &hunk, cx));
+        });
     }
 
     #[gpui::test]
@@ -2960,16 +3535,19 @@ mod tests {
                 review.hunk_visual_state(&a, cx),
                 ReviewHunkVisualState::Mixed
             );
-            assert!(
-                review
-                    .hunk_visual_state(&a, cx)
-                    .hollow(&buffer_diff::DiffHunkStatus::modified_none())
-            );
-            assert!(!review.hunk_visual_state(&a, cx).hollow(
-                &buffer_diff::DiffHunkStatus::modified(
-                    buffer_diff::DiffHunkSecondaryStatus::HasSecondaryHunk,
-                ),
-            ));
+            let entry = &review.entries[&a];
+            assert!(entry.viewed_line_presentation.is_some());
+            let current_buffer_id = entry.buffer.as_ref().unwrap().read(cx).remote_id();
+            let base_buffer_id = entry
+                .diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .base_text(cx)
+                .remote_id();
+            let hunk = buffer_diff::DiffHunkStatus::modified_none();
+            assert!(!review.diff_row_hollow(&a, current_buffer_id, 0, &hunk, cx));
+            assert!(review.diff_row_hollow(&a, base_buffer_id, 0, &hunk, cx));
         });
         let expected_buffer_id = review.read_with(cx, |review, cx| {
             assert!(matches!(
@@ -3393,7 +3971,8 @@ mod tests {
             buffer.set_text("reviewed b", cx);
         });
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.executor()
+            .advance_clock(CONTENT_EDIT_VALIDATION_DEBOUNCE);
         cx.run_until_parked();
         review.update(cx, |review, cx| {
             assert!(review.is_viewed(&b, cx));
