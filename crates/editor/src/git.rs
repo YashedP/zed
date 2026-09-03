@@ -1199,7 +1199,7 @@ impl Editor {
         let text_color = cx.theme().colors().text;
         let icon_color = cx.theme().colors().icon_accent;
         let tooltip = if self.has_diff_review_handler(cx) {
-            "Add GitHub comment (drag to select multiple lines)"
+            "Add review comment (drag to select multiple lines)"
         } else {
             "Add Review (drag to select multiple lines)"
         };

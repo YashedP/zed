@@ -24,6 +24,26 @@ struct GlabCli {
     root: PathBuf,
 }
 
+fn glab_api_args(host: &str, request: &ApiRequest) -> Vec<String> {
+    let mut args = vec![
+        "api".into(),
+        "--hostname".into(),
+        host.into(),
+        "--method".into(),
+        request.method.as_str().into(),
+        request.endpoint.clone(),
+    ];
+    if request.body.is_some() {
+        args.extend([
+            "--header".into(),
+            "Content-Type: application/json".into(),
+            "--input".into(),
+            "-".into(),
+        ]);
+    }
+    args
+}
+
 impl GitLabTransport for GlabCli {
     fn request(&self, request: ApiRequest) -> BoxFuture<'static, Result<Value>> {
         let executor = self.executor.clone();
@@ -42,23 +62,13 @@ impl GitLabTransport for GlabCli {
             let mut command = smol::process::Command::new("glab");
             command
                 .current_dir(root)
-                .args([
-                    "api",
-                    "--hostname",
-                    &host,
-                    "--method",
-                    request.method.as_str(),
-                    &request.endpoint,
-                ])
+                .args(glab_api_args(&host, &request))
                 .env("GLAB_NO_PROMPT", "1")
                 .env("GLAB_DEBUG", "")
                 .kill_on_drop(true)
                 .stdin(if has_body { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if has_body {
-                command.args(["--input", "-"]);
-            }
             let mut child = command.spawn().map_err(|_| ReviewProviderFailure {
                 message: format!(
                     "GitLab CLI could not start. Install glab and run glab auth login --hostname {host}."
@@ -106,9 +116,18 @@ impl GitLabTransport for GlabCli {
                                 .into(),
                             true,
                         )
-                    } else if error.contains("409") || error.contains("422") {
+                    } else if error.contains("400")
+                        || error.contains("409")
+                        || error.contains("422")
+                    {
                         (
-                            "GitLab rejected this discussion target. Refresh the merge request and select the lines again."
+                            "GitLab rejected this comment or discussion target. Refresh the merge request and select the lines again."
+                                .into(),
+                            true,
+                        )
+                    } else if error.contains("415") {
+                        (
+                            "GitLab rejected the request format. Update glab and retry after refreshing the merge request."
                                 .into(),
                             true,
                         )
@@ -932,6 +951,42 @@ mod tests {
             GitLabClient::with_transport(choice(), transport.clone()),
             transport,
         )
+    }
+
+    #[test]
+    fn glab_json_requests_declare_their_content_type() {
+        let endpoint = "projects/group%2Fproject/merge_requests/1/discussions";
+        let write = ApiRequest {
+            method: ApiMethod::Post,
+            writing: true,
+            endpoint: endpoint.into(),
+            body: Some(json!({"body": "Comment"})),
+        };
+        assert_eq!(
+            glab_api_args("gitlab.example.com", &write),
+            vec![
+                "api",
+                "--hostname",
+                "gitlab.example.com",
+                "--method",
+                "POST",
+                endpoint,
+                "--header",
+                "Content-Type: application/json",
+                "--input",
+                "-",
+            ]
+        );
+
+        let read = ApiRequest {
+            method: ApiMethod::Get,
+            writing: false,
+            endpoint: endpoint.into(),
+            body: None,
+        };
+        let args = glab_api_args("gitlab.example.com", &read);
+        assert!(!args.iter().any(|argument| argument == "--header"));
+        assert!(!args.iter().any(|argument| argument == "--input"));
     }
 
     #[test]

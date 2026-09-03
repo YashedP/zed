@@ -64,11 +64,48 @@ fn add_review_repository(
     }
 }
 
-fn available_review_providers(choices: &[ReviewRepositoryChoice]) -> Vec<ReviewProviderKind> {
-    [ReviewProviderKind::GitHub, ReviewProviderKind::GitLab]
-        .into_iter()
-        .filter(|provider| choices.iter().any(|choice| choice.provider == *provider))
-        .collect()
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewProviderActionState {
+    pub enabled: bool,
+    pub tooltip: String,
+}
+
+fn review_provider_action_state(
+    choices: &[ReviewRepositoryChoice],
+    loading: bool,
+    discovery_error: Option<&str>,
+    provider: ReviewProviderKind,
+) -> ReviewProviderActionState {
+    let available = choices.iter().any(|choice| choice.provider == provider);
+    if available {
+        let request = match provider {
+            ReviewProviderKind::GitHub => "pull request",
+            ReviewProviderKind::GitLab => "merge request",
+        };
+        return ReviewProviderActionState {
+            enabled: true,
+            tooltip: format!("Choose a {} {request}", provider.name()),
+        };
+    }
+
+    let tooltip = if loading {
+        format!(
+            "Checking repository remotes for {} reviews",
+            provider.name()
+        )
+    } else if let Some(error) = discovery_error {
+        format!("{error} {} reviews are unavailable.", provider.name())
+    } else {
+        let request = match provider {
+            ReviewProviderKind::GitHub => "pull requests",
+            ReviewProviderKind::GitLab => "merge requests",
+        };
+        format!("Add a {} remote to review {request}", provider.name())
+    };
+    ReviewProviderActionState {
+        enabled: false,
+        tooltip,
+    }
 }
 
 fn repositories_for_provider(
@@ -1009,8 +1046,16 @@ impl ReviewService {
         self.persist(cx);
         self.search(cx);
     }
-    pub(crate) fn available_providers(&self) -> Vec<ReviewProviderKind> {
-        available_review_providers(&self.choices)
+    pub(crate) fn provider_action_state(
+        &self,
+        provider: ReviewProviderKind,
+    ) -> ReviewProviderActionState {
+        review_provider_action_state(
+            &self.choices,
+            self.remotes_loading,
+            self.remotes_error.as_deref(),
+            provider,
+        )
     }
 
     pub(crate) fn providers_loading(&self) -> bool {
@@ -2674,13 +2719,86 @@ mod tests {
         );
 
         assert_eq!(
-            available_review_providers(std::slice::from_ref(&github)),
-            vec![ReviewProviderKind::GitHub]
+            ReviewProviderKind::ALL,
+            [ReviewProviderKind::GitHub, ReviewProviderKind::GitLab],
+            "the empty-state actions must remain in a stable order"
+        );
+
+        let no_repositories = [];
+        assert_eq!(
+            review_provider_action_state(&no_repositories, false, None, ReviewProviderKind::GitHub,),
+            ReviewProviderActionState {
+                enabled: false,
+                tooltip: "Add a GitHub remote to review pull requests".into(),
+            }
         );
         assert_eq!(
-            available_review_providers(&[github.clone(), gitlab.clone(), self_hosted]),
-            vec![ReviewProviderKind::GitHub, ReviewProviderKind::GitLab]
+            review_provider_action_state(&no_repositories, false, None, ReviewProviderKind::GitLab,),
+            ReviewProviderActionState {
+                enabled: false,
+                tooltip: "Add a GitLab remote to review merge requests".into(),
+            }
         );
+
+        let github_only = std::slice::from_ref(&github);
+        assert!(
+            review_provider_action_state(github_only, false, None, ReviewProviderKind::GitHub,)
+                .enabled
+        );
+        assert!(
+            !review_provider_action_state(github_only, false, None, ReviewProviderKind::GitLab,)
+                .enabled
+        );
+
+        let gitlab_only = std::slice::from_ref(&gitlab);
+        assert!(
+            !review_provider_action_state(gitlab_only, false, None, ReviewProviderKind::GitHub,)
+                .enabled
+        );
+        assert!(
+            review_provider_action_state(gitlab_only, false, None, ReviewProviderKind::GitLab,)
+                .enabled
+        );
+
+        let both = [github.clone(), gitlab.clone(), self_hosted];
+        assert!(
+            review_provider_action_state(&both, false, None, ReviewProviderKind::GitHub).enabled
+        );
+        assert!(
+            review_provider_action_state(&both, false, None, ReviewProviderKind::GitLab).enabled
+        );
+
+        assert_eq!(
+            review_provider_action_state(&no_repositories, true, None, ReviewProviderKind::GitLab,),
+            ReviewProviderActionState {
+                enabled: false,
+                tooltip: "Checking repository remotes for GitLab reviews".into(),
+            }
+        );
+        assert_eq!(
+            review_provider_action_state(
+                &no_repositories,
+                false,
+                Some("Could not read repository remotes."),
+                ReviewProviderKind::GitLab,
+            ),
+            ReviewProviderActionState {
+                enabled: false,
+                tooltip: "Could not read repository remotes. GitLab reviews are unavailable."
+                    .into(),
+            }
+        );
+        assert!(
+            review_provider_action_state(
+                github_only,
+                false,
+                Some("GitLab discovery failed."),
+                ReviewProviderKind::GitHub,
+            )
+            .enabled,
+            "a cached provider must remain available during an unrelated discovery failure"
+        );
+
         assert_eq!(
             repositories_for_provider(
                 &[github.clone(), gitlab.clone()],

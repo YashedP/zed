@@ -1,7 +1,7 @@
 use crate::{branch_diff::BranchDiff, branch_review::ReviewEvent, project_diff::CompareWithBranch};
 use crate::{
     github_review::{Checkout, CommentTarget, DiffSide, ReviewRepository, ReviewRequest},
-    review_provider::ReviewBackend,
+    review_provider::{ReviewBackend, ReviewProviderKind},
     review_ui::{ReviewRequestPicker, ReviewService, ReviewServiceEvent},
 };
 use anyhow::{Context as _, Result, ensure};
@@ -746,7 +746,6 @@ impl Render for BranchReviewPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_review = self.review_service.read(cx).current_review_header();
         let provider = self.review_service.read(cx).identity();
-        let available_providers = self.review_service.read(cx).available_providers();
         let providers_loading = self.review_service.read(cx).providers_loading();
         let provider_discovery_error = self
             .review_service
@@ -934,10 +933,12 @@ impl Render for BranchReviewPanel {
                 view.child(
                     v_flex()
                         .gap_1()
-                        .children(available_providers.into_iter().enumerate().map(
+                        .children(ReviewProviderKind::ALL.into_iter().enumerate().map(
                             |(index, provider)| {
                                 let picker = self.review_service.clone();
                                 let loader = self.review_service.clone();
+                                let action =
+                                    self.review_service.read(cx).provider_action_state(provider);
                                 div().px_2().child(
                                     PopoverMenu::new(("branch-review-empty-request-picker", index))
                                         .full_width(true)
@@ -963,7 +964,9 @@ impl Render for BranchReviewPanel {
                                                 ("choose-remote-review", index),
                                                 format!("Choose {} review", provider.name()),
                                             )
-                                            .full_width(),
+                                            .full_width()
+                                            .disabled(!action.enabled)
+                                            .tooltip(Tooltip::text(action.tooltip)),
                                         ),
                                 )
                             },

@@ -9,6 +9,8 @@ pub(crate) enum ReviewProviderKind {
 }
 
 impl ReviewProviderKind {
+    pub(crate) const ALL: [Self; 2] = [Self::GitHub, Self::GitLab];
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::GitHub => "GitHub",
