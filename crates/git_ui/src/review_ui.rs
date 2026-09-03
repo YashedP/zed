@@ -21,8 +21,12 @@ use gpui::{
 use picker::{Picker, PickerDelegate};
 use project::{Project, git_store::Repository};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
-use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use ui::{ButtonLike, CommonAnimationExt, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 fn review_repository_from_remote(remote: &str, cx: &App) -> Option<ReviewRepositoryChoice> {
@@ -579,6 +583,63 @@ impl Render for InlineReviewComposer {
     }
 }
 
+const DISCUSSION_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct DiscussionPolling {
+    active: bool,
+    last_success: Option<Instant>,
+    retry_at: Option<Instant>,
+    failures: u32,
+    authentication_required: bool,
+}
+
+impl DiscussionPolling {
+    fn delay(&self, now: Instant) -> Option<Duration> {
+        if !self.active || self.authentication_required {
+            return None;
+        }
+        Some(
+            self.retry_at
+                .or_else(|| {
+                    self.last_success
+                        .map(|last| last + DISCUSSION_REFRESH_INTERVAL)
+                })
+                .map_or(Duration::ZERO, |deadline| {
+                    deadline.saturating_duration_since(now)
+                }),
+        )
+    }
+
+    fn succeeded(&mut self, now: Instant) {
+        self.last_success = Some(now);
+        self.retry_at = None;
+        self.failures = 0;
+        self.authentication_required = false;
+    }
+
+    fn failed(&mut self, now: Instant, authentication_required: bool) {
+        self.failures = self.failures.saturating_add(1);
+        self.authentication_required = authentication_required;
+        let seconds = (60_u64 << self.failures.saturating_sub(1).min(3)).min(300);
+        self.retry_at = Some(now + Duration::from_secs(seconds));
+    }
+}
+
+#[derive(Default)]
+struct DiscussionRefresh {
+    polling: DiscussionPolling,
+    generation: u64,
+    client: Option<ReviewClient>,
+    task: Option<Task<()>>,
+    timer: Option<Task<()>>,
+    refreshing: bool,
+    full_in_flight: bool,
+    queued_full: bool,
+    snapshot: Option<std::sync::Arc<github_review::DiscussionSnapshot>>,
+    error: Option<String>,
+}
+
 pub(crate) struct ReviewService {
     project: Entity<Project>,
     review: Option<gpui::WeakEntity<crate::branch_review::BranchReview>>,
@@ -598,6 +659,7 @@ pub(crate) struct ReviewService {
     preview: Option<ReviewRequest>,
     pub checkout: Option<Checkout>,
     discussion: Vec<DiscussionComment>,
+    discussion_refresh: DiscussionRefresh,
     viewer: Option<String>,
     thread_error: Option<String>,
     markdown: BTreeMap<String, (String, Entity<markdown::Markdown>)>,
@@ -708,6 +770,7 @@ impl ReviewService {
             preview: None,
             checkout: None,
             discussion: Vec::new(),
+            discussion_refresh: DiscussionRefresh::default(),
             viewer: None,
             thread_error: None,
             markdown: BTreeMap::new(),
@@ -753,6 +816,7 @@ impl ReviewService {
         }
         // Never abandon a request whose server outcome may already be committed.
         if self.posting {
+            self.reset_discussion_refresh();
             self.detached = true;
             cx.notify();
             return;
@@ -760,6 +824,7 @@ impl ReviewService {
         self.generation += 1;
         self.task = None;
         self.busy = false;
+        self.reset_discussion_refresh();
         self.repository = repository;
         self.root = root;
         self.checkout = None;
@@ -919,6 +984,22 @@ impl ReviewService {
     }
 
     pub fn attach(&mut self, checkout: Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_discussion_refresh();
+        if let Some(root) = self.root.clone() {
+            let repository = &checkout.repository;
+            self.discussion_refresh.client = Some(ReviewClient::for_choice(
+                ReviewRepositoryChoice {
+                    provider: repository.provider,
+                    host: repository.host.clone(),
+                    full_name: repository.full_name.clone(),
+                    remote_url: repository.web_url.clone().unwrap_or_else(|| {
+                        format!("https://{}/{}", repository.host, repository.full_name)
+                    }),
+                },
+                root,
+                cx.background_executor().clone(),
+            ));
+        }
         self.remove_inline_composer(true, cx);
         self.save_draft(cx);
         self.generation += 1;
@@ -964,6 +1045,7 @@ impl ReviewService {
         cx.notify();
     }
     pub fn close_review(&mut self, cx: &mut Context<Self>) {
+        self.reset_discussion_refresh();
         self.remove_inline_composer(true, cx);
         self.save_draft(cx);
         self.detached = true;
@@ -979,6 +1061,7 @@ impl ReviewService {
     }
 
     pub fn detach(&mut self, cx: &mut Context<Self>) {
+        self.reset_discussion_refresh();
         self.remove_inline_composer(true, cx);
         self.detached = true;
         cx.notify();
@@ -1329,7 +1412,7 @@ impl ReviewService {
             preview.0 = body;
         }
         let preview = preview.1.clone();
-        let pending = self.busy || self.posting;
+        let pending = self.busy || self.discussion_refresh.refreshing || self.posting;
         let unknown = self.draft().is_some_and(|draft| draft.outcome_unknown);
         let target = target_label(&self.target);
         let provider_name = self.identity().name;
@@ -1549,128 +1632,263 @@ impl ReviewService {
         cx.notify();
     }
 
+    fn reset_discussion_refresh(&mut self) {
+        let generation = self.discussion_refresh.generation + 1;
+        self.discussion_refresh = DiscussionRefresh {
+            generation,
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn suspend_discussion_refresh(&mut self) {
+        self.discussion_refresh.generation += 1;
+        self.discussion_refresh.task = None;
+        self.discussion_refresh.timer = None;
+        self.discussion_refresh.refreshing = false;
+        self.discussion_refresh.full_in_flight = false;
+        self.discussion_refresh.queued_full = false;
+        self.discussion_refresh.polling.active = false;
+    }
+
+    pub(crate) fn set_discussion_activity(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.discussion_refresh.polling.active != active {
+            self.discussion_refresh.polling.active = active;
+            self.schedule_discussion_refresh(cx);
+        }
+    }
+
+    pub(crate) fn discussion_refreshing(&self) -> bool {
+        self.discussion_refresh.refreshing
+    }
+
+    pub(crate) fn discussion_refresh_error(&self) -> Option<&str> {
+        self.discussion_refresh.error.as_deref()
+    }
+
+    pub(crate) fn render_refresh_button(
+        &self,
+        checkout_in_progress: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let refreshing = self.discussion_refreshing();
+        let error = self.discussion_refresh_error();
+        let tooltip = error.map_or_else(
+            || "Refresh comments".to_string(),
+            |error| format!("Refresh comments: {error} Displayed comments may be stale."),
+        );
+        ButtonLike::new("refresh-review-comments")
+            .aria_label("Refresh comments")
+            .disabled(
+                checkout_in_progress || refreshing || self.busy || self.posting || self.detached,
+            )
+            .tooltip(Tooltip::text(tooltip))
+            .child(if refreshing {
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                Icon::new(if error.is_some() {
+                    IconName::Warning
+                } else {
+                    IconName::ArrowCircle
+                })
+                .size(IconSize::Small)
+                .color(if error.is_some() {
+                    Color::Warning
+                } else {
+                    Color::Default
+                })
+                .into_any_element()
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_discussion(cx)))
+            .into_any_element()
+    }
+
+    fn schedule_discussion_refresh(&mut self, cx: &mut Context<Self>) {
+        self.discussion_refresh.timer = None;
+        if self.detached
+            || self.checkout.is_none()
+            || self.posting
+            || self.discussion_refresh.refreshing
+        {
+            return;
+        }
+        if self.discussion_refresh.queued_full {
+            self.discussion_refresh.queued_full = false;
+            self.start_discussion_refresh(true, cx);
+            return;
+        }
+        let Some(delay) = self
+            .discussion_refresh
+            .polling
+            .delay(cx.background_executor().now())
+        else {
+            return;
+        };
+        if delay.is_zero() {
+            self.start_discussion_refresh(false, cx);
+        } else {
+            self.discussion_refresh.timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |this, cx| {
+                    this.discussion_refresh.timer = None;
+                    this.schedule_discussion_refresh(cx);
+                })
+                .log_err();
+            }));
+        }
+    }
+
     pub fn refresh_discussion(&mut self, cx: &mut Context<Self>) {
-        if self.posting {
+        self.discussion_refresh.polling.authentication_required = false;
+        self.discussion_refresh.polling.retry_at = None;
+        self.start_discussion_refresh(true, cx);
+    }
+
+    fn start_discussion_refresh(&mut self, full: bool, cx: &mut Context<Self>) {
+        if self.detached {
+            return;
+        }
+        if self.posting || self.discussion_refresh.refreshing {
+            self.discussion_refresh.queued_full |= full && !self.discussion_refresh.full_in_flight;
             return;
         }
         let Some(checkout) = self.checkout.clone() else {
             return;
         };
-        self.generation += 1;
-        let generation = self.generation;
-        let root = self.root.clone();
-        let Some(client) = self.client.clone() else {
-            self.error = Some("Review provider is unavailable".into());
-            cx.notify();
+        let Some(client) = self.discussion_refresh.client.clone() else {
             return;
         };
-        self.busy = true;
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.discussion_refresh.timer = None;
+        self.discussion_refresh.generation += 1;
+        let generation = self.discussion_refresh.generation;
+        let root = self.root.clone();
+        let viewer = self.viewer.clone();
+        let previous = self.discussion_refresh.snapshot.clone();
+        let full = full || previous.is_none();
+        if full {
+            self.discussion_refresh.queued_full = false;
+        }
+        self.discussion_refresh.refreshing = true;
+        self.discussion_refresh.full_in_flight = full;
+        self.discussion_refresh.task = Some(cx.spawn(async move |this, cx| {
             let result: Result<_> = async {
-                let pr = client
-                    .review_request(&checkout.repository, checkout.pull_request.number)
-                    .await?;
-                let mut comments = client.discussion(&checkout.repository, pr.number).await?;
-                let (viewer, thread_error) = match client.viewer().await {
-                    Ok(viewer) => (Some(viewer.login), None),
-                    Err(error) => (
-                        None,
-                        Some(format!("Comment permissions unavailable: {error}")),
-                    ),
-                };
-                let thread_error =
-                    match client.review_threads(&checkout.repository, pr.number).await {
-                        Ok(threads) => {
-                            let by_comment: BTreeMap<_, _> = threads
-                                .into_iter()
-                                .flat_map(|thread| {
-                                    let thread = std::sync::Arc::new(thread);
-                                    thread
-                                        .comments
-                                        .iter()
-                                        .map(|comment| (comment.database_id, thread.clone()))
-                                        .collect::<Vec<_>>()
-                                })
-                                .collect();
-                            for entry in &mut comments {
-                                if entry.kind == CommentKind::Inline {
-                                    entry.comment.thread =
-                                        by_comment.get(&entry.comment.id).cloned();
-                                }
-                            }
-                            thread_error
-                        }
-                        Err(error) => Some(format!(
-                            "Thread state unavailable: {error}. Existing comments remain readable."
-                        )),
-                    };
-                let placement = if let Some(root) = root {
-                    github_review::published_comments(
-                        cx.background_executor(),
-                        &root,
-                        &checkout,
-                        &comments,
+                let request = if full {
+                    Some(
+                        client
+                            .review_request(&checkout.repository, checkout.pull_request.number)
+                            .await?,
                     )
-                    .await
                 } else {
-                    Ok(Vec::new())
+                    None
                 };
-                let (inline, warning) = match placement {
-                    Ok(inline) => (inline, None),
-                    Err(error) => (
-                        Vec::new(),
-                        Some(format!(
-                            "Discussion refreshed; inline placement is unavailable: {error}"
-                        )),
-                    ),
+                let snapshot = client
+                    .discussion_snapshot(&checkout.repository, checkout.pull_request.number, viewer)
+                    .await?;
+                let changed = previous.as_deref() != Some(&snapshot);
+                let inline = if changed {
+                    if let Some(root) = root {
+                        Some(
+                            github_review::published_comments(
+                                cx.background_executor(),
+                                &root,
+                                &checkout,
+                                &snapshot.comments,
+                            )
+                            .await,
+                        )
+                    } else {
+                        Some(Ok(Vec::new()))
+                    }
+                } else {
+                    None
                 };
-                Ok((pr, comments, inline, warning, viewer, thread_error))
+                Ok((request, snapshot, inline))
             }
             .await;
             this.update(cx, |this, cx| {
-                if generation != this.generation {
+                if generation != this.discussion_refresh.generation || this.detached {
                     return;
                 }
-                this.busy = false;
+                this.discussion_refresh.refreshing = false;
+                this.discussion_refresh.full_in_flight = false;
+                this.discussion_refresh.task = None;
+                let now = cx.background_executor().now();
                 match result {
-                    Ok((pr, comments, inline, warning, viewer, thread_error)) => {
-                        this.viewer = viewer;
-                        this.thread_error = thread_error;
-                        this.markdown.retain(|key, _| {
-                            comments.iter().any(|entry| key == &comment_key(entry))
-                        });
-                        let checkout = this.checkout.clone();
-                        cx.emit(ReviewServiceEvent::CommentsLoaded(
-                            inline
-                                .into_iter()
-                                .filter_map(github_review::PublishedComment::into_placed)
-                                .map(|mut comment| {
-                                    comment.url = checkout.as_ref().and_then(|checkout| {
-                                        comment.id.parse::<u64>().ok().map(|id| {
-                                            let anchor = if checkout.repository.provider
-                                                == ReviewProviderKind::GitLab
-                                            {
-                                                format!("note_{id}")
-                                            } else {
-                                                format!("discussion_r{id}")
-                                            };
-                                            format!(
-                                                "{}#{anchor}",
-                                                checkout.pull_request.url(&checkout.repository),
-                                            )
-                                        })
+                    Ok((request, snapshot, inline)) => {
+                        this.discussion_refresh.error = None;
+                        this.viewer = snapshot.viewer.clone();
+                        this.thread_error = snapshot.permission_error.clone();
+                        if let Some(inline) = inline {
+                            match inline {
+                                Ok(inline) => {
+                                    let comments = &snapshot.comments;
+                                    this.markdown.retain(|key, _| {
+                                        comments.iter().any(|entry| key == &comment_key(entry))
                                     });
-                                    comment
-                                })
-                                .collect(),
-                        ));
-                        this.preview = Some(pr);
-                        this.discussion = comments;
-                        this.reconciled = true;
-                        this.error = warning;
+                                    cx.emit(ReviewServiceEvent::CommentsLoaded(
+                                        inline
+                                            .into_iter()
+                                            .filter_map(
+                                                github_review::PublishedComment::into_placed,
+                                            )
+                                            .map(|mut comment| {
+                                                comment.url =
+                                                    comment.id.parse::<u64>().ok().map(|id| {
+                                                        let anchor = if checkout.repository.provider
+                                                            == ReviewProviderKind::GitLab
+                                                        {
+                                                            format!("note_{id}")
+                                                        } else {
+                                                            format!("discussion_r{id}")
+                                                        };
+                                                        format!(
+                                                            "{}#{anchor}",
+                                                            checkout
+                                                                .pull_request
+                                                                .url(&checkout.repository)
+                                                        )
+                                                    });
+                                                comment
+                                            })
+                                            .collect(),
+                                    ));
+                                    this.discussion = snapshot.comments.clone();
+                                    this.discussion_refresh.snapshot =
+                                        Some(std::sync::Arc::new(snapshot));
+                                }
+                                Err(error) => {
+                                    this.discussion_refresh.error = Some(format!(
+                                        "Inline comment placement is unavailable: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(request) = request {
+                            this.preview = Some(request);
+                            this.reconciled = true;
+                        }
+                        if this.discussion_refresh.error.is_none() {
+                            this.discussion_refresh.error = this.thread_error.clone();
+                        }
+                        if this.discussion_refresh.error.is_some() {
+                            this.discussion_refresh.polling.failed(now, false);
+                        } else {
+                            this.discussion_refresh.polling.succeeded(now);
+                        }
                     }
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.viewer = None;
+                        this.discussion_refresh.polling.failed(
+                            now,
+                            error.is::<github_review::ReviewAuthenticationRequired>(),
+                        );
+                        this.discussion_refresh.error = Some(format!("{error:#}"));
+                    }
                 }
+                this.schedule_discussion_refresh(cx);
                 cx.notify();
             })
             .log_err();
@@ -1737,7 +1955,12 @@ impl ReviewService {
     }
 
     fn run_discussion_action(&mut self, action: DiscussionAction, cx: &mut Context<Self>) {
-        if self.busy || self.posting || self.detached || self.load_failed {
+        if self.busy
+            || self.discussion_refresh.refreshing
+            || self.posting
+            || self.detached
+            || self.load_failed
+        {
             return;
         }
         let (Some(checkout), Some(key), Some(storage_key)) = (
@@ -1802,6 +2025,7 @@ impl ReviewService {
                 }
                 let repository = this.project.read(cx).active_repository(cx);
                 this.set_repository(repository, cx);
+                this.schedule_discussion_refresh(cx);
                 cx.notify();
             })
             .log_err();
@@ -1907,6 +2131,7 @@ impl ReviewService {
             groups[index].push(entry.clone());
         }
         let pending = self.busy
+            || self.discussion_refresh.refreshing
             || self.posting
             || self.detached
             || self
@@ -2187,6 +2412,7 @@ impl ReviewService {
     fn post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.posting
             || self.busy
+            || self.discussion_refresh.refreshing
             || self.detached
             || self.load_failed
             || self.draft().is_some_and(|draft| draft.outcome_unknown)
@@ -2341,6 +2567,7 @@ impl ReviewService {
                 this.persist(cx);
                 let repository = this.project.read(cx).active_repository(cx);
                 this.set_repository(repository, cx);
+                this.schedule_discussion_refresh(cx);
                 cx.notify();
             })
             .log_err();
@@ -2393,6 +2620,55 @@ impl ReviewBackend for ReviewService {
 
 impl Render for ReviewService {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let container = v_flex()
+            .id("review-conversation-content")
+            .w(rems(22.))
+            .max_h(rems(28.))
+            .min_h_0()
+            .gap_2()
+            .p_2()
+            .elevation_3(cx)
+            .overflow_hidden()
+            .overflow_y_scroll();
+        if self.discussion_refresh.refreshing
+            && self.discussion_refresh.snapshot.is_none()
+            && !self.posting
+        {
+            return container.h(rems(16.)).child(
+                v_flex()
+                    .debug_selector(|| "review-discussion-loading".into())
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .px_4()
+                    .pb_8()
+                    .child(
+                        v_flex()
+                            .w_64()
+                            .max_w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::LoadCircle)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent)
+                                            .with_rotate_animation(2),
+                                    )
+                                    .child(Label::new("Loading discussion")),
+                            )
+                            .child(
+                                div().text_center().child(
+                                    Label::new("Fetching conversation and review details…")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            ),
+                    ),
+            );
+        }
         let discussion = self.render_discussion(window, cx);
         let body = self.composer.read(cx).text(cx);
         let languages = self.project.read(cx).languages().clone();
@@ -2412,30 +2688,21 @@ impl Render for ReviewService {
         let unknown_action = self
             .action_key()
             .is_some_and(|key| self.saved.pending_actions.contains_key(&key));
-        let pending = self.busy || self.posting;
+        let pending = self.busy || self.discussion_refresh.refreshing || self.posting;
         let unknown = self.draft().is_some_and(|draft| draft.outcome_unknown);
         let provider_name = self.identity().name;
-        v_flex()
-            .id("review-conversation-content")
-            .w(rems(22.))
-            .max_h(rems(28.))
-            .min_h_0()
-            .gap_2()
-            .p_2()
-            .elevation_3(cx)
-            .overflow_hidden()
-            .overflow_y_scroll()
+        container
+            .when_some(self.discussion_refresh.error.clone(), |view, error| {
+                view.child(Label::new(format!("{error} Displayed comments may be stale."))
+                    .size(LabelSize::Small).color(Color::Warning))
+            })
             .when_some(self.error.clone(), |view, error| {
                 view.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
             })
-            .when(pending, |view| {
+            .when(self.posting, |view| {
                 view.child(
-                    Label::new(if self.posting {
-                        format!("Posting to {provider_name}…")
-                    } else {
-                        format!("Loading {provider_name}…")
-                    })
-                    .size(LabelSize::Small),
+                    Label::new(format!("Posting to {provider_name}…"))
+                        .size(LabelSize::Small),
                 )
             })
             .when_some(self.checkout.clone(), |view, checkout| {
@@ -2449,7 +2716,7 @@ impl Render for ReviewService {
                         .gap_1()
                         .flex_wrap()
                         .child(
-                            Button::new("refresh-review-conversation", "Refresh")
+                            Button::new("refresh-review-conversation", "Refresh comments")
                                 .disabled(pending)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.refresh_discussion(cx)
@@ -2686,6 +2953,322 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
+
+    #[derive(Default)]
+    struct PollingTransport {
+        requests: std::sync::Mutex<Vec<String>>,
+        failures: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+        version: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PollingTransport {
+        fn count(&self, suffix: &str) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|endpoint| endpoint.ends_with(suffix))
+                .count()
+        }
+    }
+
+    impl github_review::GitHubTransport for PollingTransport {
+        fn request(
+            &self,
+            request: github_review::ApiRequest,
+        ) -> futures::future::BoxFuture<'static, Result<serde_json::Value>> {
+            use futures::FutureExt as _;
+            assert!(!request.writing);
+            self.requests.lock().unwrap().push(request.endpoint.clone());
+            let failure = self.failures.lock().unwrap().pop_front();
+            let gate = self.gate.lock().unwrap().take();
+            let version = self.version.load(std::sync::atomic::Ordering::SeqCst);
+            let value = if request.endpoint == "user" {
+                json!({"login": "reviewer"})
+            } else if request.endpoint == "graphql" {
+                json!({"data":{"repository":{"pullRequest":{"reviewThreads":{
+                    "nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}
+                }}}}})
+            } else if request.endpoint.ends_with("/pulls/1") {
+                serde_json::to_value(checkout(1).pull_request).unwrap()
+            } else if request.endpoint.contains("issues/1/comments") && version > 0 {
+                json!([{"id":1,"body":format!("reply {version}"),"user":{"login":"author"}}])
+            } else {
+                json!([])
+            };
+            async move {
+                if let Some(gate) = gate {
+                    gate.await?;
+                }
+                if let Some(authentication) = failure {
+                    return Err(if authentication {
+                        anyhow::Error::new(github_review::ReviewAuthenticationRequired)
+                    } else {
+                        anyhow::anyhow!("Network unavailable")
+                    });
+                }
+                Ok(value)
+            }
+            .boxed()
+        }
+    }
+
+    async fn polling_service(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ReviewService>,
+        &mut gpui::VisualTestContext,
+        std::sync::Arc<PollingTransport>,
+    ) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"a.txt":"base"}))
+            .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewService::new(project, window, cx));
+        let transport = std::sync::Arc::new(PollingTransport::default());
+        view.update_in(cx, |view, window, cx| {
+            view.attach(checkout(1), window, cx);
+            view.discussion_refresh.client = Some(ReviewClient::GitHub(
+                github_review::GitHubClient::with_transport(transport.clone()),
+            ));
+        });
+        (view, cx, transport)
+    }
+
+    #[gpui::test]
+    async fn discussion_polling_is_activity_gated_and_skips_unchanged_publication(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, transport) = polling_service(cx).await;
+        let publications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = publications.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, ReviewServiceEvent::CommentsLoaded(_)) {
+                    counter.set(counter.get() + 1);
+                }
+            })
+        });
+        cx.executor().advance_clock(Duration::from_secs(120));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 0);
+        view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 1);
+        assert_eq!(publications.get(), 1);
+        view.update_in(cx, |view, window, cx| {
+            view.expanded_comments.insert("keep-expanded".into());
+            view.composer.update(cx, |editor, cx| {
+                editor.set_text("keep my draft", window, cx)
+            });
+        });
+        cx.executor().advance_clock(Duration::from_secs(59));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 1);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 2);
+        assert_eq!(
+            transport.count("/pulls/1"),
+            1,
+            "polling must not refetch PR metadata"
+        );
+        assert_eq!(
+            transport.count("user"),
+            1,
+            "viewer is cached for the attachment"
+        );
+        assert_eq!(
+            publications.get(),
+            1,
+            "unchanged responses must not rebuild inline blocks"
+        );
+        transport
+            .version
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert_eq!(publications.get(), 2);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.discussion[0].comment.body.as_deref(), Some("reply 1"));
+            assert_eq!(view.composer.read(cx).text(cx), "keep my draft");
+            assert!(view.expanded_comments.contains("keep-expanded"));
+        });
+        view.update(cx, |view, cx| view.set_discussion_activity(false, cx));
+        cx.executor().advance_clock(Duration::from_secs(600));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 3);
+        view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            transport.count("graphql"),
+            4,
+            "resume performs one stale refresh, not catch-up requests"
+        );
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            transport.count("/pulls/1"),
+            2,
+            "manual refresh performs full validation"
+        );
+        view.update(cx, |view, _| view.posting = true);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 5);
+        view.update(cx, |view, cx| {
+            view.posting = false;
+            view.schedule_discussion_refresh(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(transport.count("graphql"), 6);
+        assert_eq!(
+            transport.count("/pulls/1"),
+            3,
+            "a refresh requested during posting is coalesced into one full refresh"
+        );
+    }
+
+    #[gpui::test]
+    async fn discussion_polling_backs_off_and_authentication_requires_manual_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, transport) = polling_service(cx).await;
+        view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+        cx.run_until_parked();
+        transport.failures.lock().unwrap().push_back(false);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        for seconds in [60, 120, 240, 300] {
+            let requests = transport.requests.lock().unwrap().len();
+            view.update(cx, |view, cx| view.set_discussion_activity(false, cx));
+            view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                transport.requests.lock().unwrap().len(),
+                requests,
+                "focus must not bypass backoff"
+            );
+            view.read_with(cx, |view, cx| {
+                assert_eq!(
+                    view.discussion_refresh
+                        .polling
+                        .delay(cx.background_executor().now()),
+                    Some(Duration::from_secs(seconds))
+                );
+                assert!(view.discussion_refresh_error().is_some());
+                assert!(
+                    view.discussion_refresh.snapshot.is_some(),
+                    "keep cached discussion on failure"
+                );
+            });
+            cx.executor()
+                .advance_clock(Duration::from_secs(seconds - 1));
+            cx.run_until_parked();
+            assert_eq!(transport.requests.lock().unwrap().len(), requests);
+            transport.failures.lock().unwrap().push_back(seconds == 300);
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            assert!(transport.requests.lock().unwrap().len() > requests);
+        }
+        let requests = transport.requests.lock().unwrap().len();
+        cx.executor().advance_clock(Duration::from_secs(3600));
+        view.update(cx, |view, cx| view.set_discussion_activity(false, cx));
+        view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+        cx.run_until_parked();
+        assert_eq!(transport.requests.lock().unwrap().len(), requests);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.discussion_refresh.polling.authentication_required);
+            assert_eq!(view.discussion_refresh.polling.failures, 0);
+            assert!(view.discussion_refresh_error().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn discussion_refresh_keeps_the_composer_visible_and_focused_after_initial_load(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, transport) = polling_service(cx).await;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(receiver);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("review-discussion-loading").is_some());
+        sender.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("review-discussion-loading").is_none());
+        let focus = view.update_in(cx, |view, window, cx| {
+            view.composer.update(cx, |editor, cx| {
+                editor.set_text("unfinished reply", window, cx)
+            });
+            let focus = view.composer.focus_handle(cx);
+            focus.focus(window, cx);
+            focus
+        });
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(receiver);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("review-discussion-loading").is_none());
+        cx.update(|window, _| assert!(focus.is_focused(window)));
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.composer.read(cx).text(cx), "unfinished reply")
+        });
+        sender.send(()).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    async fn discussion_refresh_coalesces_and_cannot_publish_after_detach(cx: &mut TestAppContext) {
+        let (view, cx, transport) = polling_service(cx).await;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(receiver);
+        view.update(cx, |view, cx| view.set_discussion_activity(true, cx));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            view.update(cx, |view, cx| view.refresh_discussion(cx));
+        }
+        assert_eq!(transport.count("/pulls/1"), 1);
+        sender.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            transport.count("/pulls/1"),
+            1,
+            "concurrent full refreshes coalesce"
+        );
+        let picker_generation = view.read_with(cx, |view, _| view.generation);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(receiver);
+        view.update(cx, |view, cx| view.refresh_discussion(cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.generation, picker_generation);
+            view.detach(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            sender.send(()).is_err(),
+            "detaching cancels the obsolete request"
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.discussion_refresh.snapshot.is_none());
+            assert!(!view.discussion_refreshing());
+            assert!(view.discussion_refresh.timer.is_none());
+        });
+    }
 
     fn repository_choice(
         provider: ReviewProviderKind,

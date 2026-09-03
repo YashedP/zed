@@ -15,7 +15,7 @@ use project::git_store::{GitStoreEvent, diff_buffer_list::DiffBase};
 use serde::{Deserialize, Serialize};
 use settings::{IntoGpui as _, Settings};
 use std::{ops::Range, path::PathBuf};
-use ui::{ButtonLike, PopoverMenu, Tooltip, prelude::*};
+use ui::{ButtonLike, CommonAnimationExt, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Panel, Workspace,
@@ -110,10 +110,19 @@ struct ReviewSession {
     _subscription: Subscription,
 }
 
+#[derive(Clone)]
+struct PendingReview {
+    provider: ReviewProviderKind,
+    number: u64,
+    title: String,
+}
+
 pub struct BranchReviewPanel {
     workspace: WeakEntity<Workspace>,
     review_service: Entity<ReviewService>,
     checkout_task: Option<Task<()>>,
+    pending_review: Option<PendingReview>,
+    conversation_menu: PopoverMenuHandle<ReviewService>,
     pending_checkout: Option<Checkout>,
     ignored_item: Option<gpui::EntityId>,
     write_generation: u64,
@@ -171,6 +180,24 @@ impl BranchReviewPanel {
         let review_service =
             cx.new(|cx| ReviewService::new(workspace.project().clone(), window, cx));
         let subscriptions = vec![
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.update_discussion_activity(window, cx);
+            }),
+            cx.observe_in(&review_service, window, |_, _, window, cx| {
+                cx.defer_in(window, |this, window, cx| {
+                    this.update_discussion_activity(window, cx);
+                    cx.notify();
+                });
+            }),
+            cx.subscribe_in(
+                &review_service,
+                window,
+                |_, _, _: &gpui::DismissEvent, window, cx| {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.update_discussion_activity(window, cx)
+                    });
+                },
+            ),
             cx.subscribe_in(
                 &review_service,
                 window,
@@ -194,7 +221,8 @@ impl BranchReviewPanel {
                     workspace::Event::ActiveItemChanged | workspace::Event::ItemAdded { .. }
                 ) {
                     cx.defer_in(window, |this, window, cx| {
-                        this.follow_review_item(window, cx)
+                        this.follow_review_item(window, cx);
+                        this.update_discussion_activity(window, cx);
                     });
                 }
             }),
@@ -207,7 +235,8 @@ impl BranchReviewPanel {
                         | GitStoreEvent::ActiveRepositoryChanged(_)
                 ) {
                     cx.defer_in(window, |this, window, cx| {
-                        this.reconcile_repository(window, cx)
+                        this.reconcile_repository(window, cx);
+                        this.update_discussion_activity(window, cx);
                     });
                 }
             }),
@@ -230,11 +259,14 @@ impl BranchReviewPanel {
         cx.defer_in(window, |this, window, cx| {
             this.follow_review_item(window, cx);
             this.reconcile_repository(window, cx);
+            this.update_discussion_activity(window, cx);
         });
         Self {
             workspace: workspace_handle.downgrade(),
             review_service,
             checkout_task: None,
+            pending_review: None,
+            conversation_menu: PopoverMenuHandle::default(),
             pending_checkout: None,
             ignored_item: None,
             write_generation: 0,
@@ -247,6 +279,26 @@ impl BranchReviewPanel {
             warning: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn discussion_is_active(&self, window: &Window, cx: &App) -> bool {
+        let active_diff = self.session.as_ref().is_some_and(|session| {
+            self.workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.active_item_as::<BranchDiff>(cx).as_ref() == Some(&session.item)
+                })
+                .unwrap_or(false)
+        });
+        window.is_window_active()
+            && (active_diff || self.conversation_menu.is_deployed())
+            && self.checkout_task.is_none()
+    }
+
+    fn update_discussion_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.discussion_is_active(window, cx);
+        self.review_service.update(cx, |service, cx| {
+            service.set_discussion_activity(active, cx)
+        });
     }
 
     fn follow_review_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -384,6 +436,7 @@ impl BranchReviewPanel {
             comparison,
             _subscription: Subscription::join(subscription, item_subscription),
         });
+        self.update_discussion_activity(window, cx);
         self.persist(cx);
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
@@ -486,8 +539,15 @@ impl BranchReviewPanel {
         let root = repository.read(cx).work_directory_abs_path.to_path_buf();
         let request_name = repo.provider.request_name();
         let previous = self.review_service.read(cx).checkout.clone();
+        self.review_service
+            .update(cx, |service, _| service.suspend_discussion_refresh());
         self.error = None;
         self.warning = None;
+        self.pending_review = Some(PendingReview {
+            provider: repo.provider,
+            number: pr.number,
+            title: pr.title.clone(),
+        });
         let weak_repository = repository.downgrade();
         let project_for_job = project.clone();
         let job = repository.update(cx, |repository, _| repository.send_job("open_review_request", Some(format!("Opening {request_name} checkout").into()), move |state, cx| async move {
@@ -525,9 +585,11 @@ impl BranchReviewPanel {
             }.await;
             this.update_in(cx, |this, window, cx| {
                 this.checkout_task = None;
+                this.pending_review = None;
                 if let Err(error) = result { this.error = Some(format!("{error:#}")); }
                 this.follow_review_item(window, cx);
                 this.reconcile_repository(window, cx);
+                this.update_discussion_activity(window, cx);
                 cx.notify();
             }).log_err();
         }));
@@ -752,12 +814,18 @@ impl Render for BranchReviewPanel {
             .read(cx)
             .provider_discovery_error()
             .map(str::to_string);
+        let checkout_in_progress = self
+            .checkout_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready());
+        let pending_review = self.pending_review.clone();
         let has_current_review = current_review.is_some();
+        let current_review = current_review.filter(|_| !checkout_in_progress);
         let attached_provider = provider.kind;
         let review_picker = self.review_service.clone();
         let load_review_picker = self.review_service.clone();
         let conversation = self.review_service.clone();
-        let load_conversation = self.review_service.clone();
+        let conversation_panel = cx.weak_entity();
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
@@ -772,6 +840,7 @@ impl Render for BranchReviewPanel {
                     .child(div().flex_1())
                     .child(
                         IconButton::new("select-comparison", IconName::GitBranch)
+                            .disabled(checkout_in_progress)
                             .tooltip(Tooltip::text("Select a branch to compare"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.ignored_item = None;
@@ -892,12 +961,18 @@ impl Render for BranchReviewPanel {
                                             ),
                                     ),
                                 )
+                                .child(self.review_service.update(cx, |service, cx| {
+                                    service.render_refresh_button(checkout_in_progress, cx)
+                                }))
                                 .child(
                                     PopoverMenu::new("branch-review-conversation")
-                                        .on_open(std::rc::Rc::new(move |_, cx| {
-                                            load_conversation.update(cx, |review, cx| {
-                                                review.refresh_discussion(cx)
-                                            });
+                                        .with_handle(self.conversation_menu.clone())
+                                        .on_open(std::rc::Rc::new(move |window, cx| {
+                                            conversation_panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.update_discussion_activity(window, cx);
+                                                })
+                                                .log_err();
                                         }))
                                         .menu(move |_, _| Some(conversation.clone()))
                                         .anchor(gpui::Anchor::TopRight)
@@ -929,7 +1004,7 @@ impl Render for BranchReviewPanel {
                         ),
                 )
             })
-            .when(!has_current_review, |view| {
+            .when(!has_current_review && !checkout_in_progress, |view| {
                 view.child(
                     v_flex()
                         .gap_1()
@@ -992,14 +1067,65 @@ impl Render for BranchReviewPanel {
                         }),
                 )
             })
-            .when(
-                self.checkout_task
-                    .as_ref()
-                    .is_some_and(|task| !task.is_ready()),
-                |view| view.child(Label::new("Preparing review checkout…").size(LabelSize::Small)),
-            )
+            .when(checkout_in_progress, |view| {
+                view.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .items_center()
+                        .justify_center()
+                        .px_4()
+                        .pb_8()
+                        .child(
+                            v_flex()
+                                .w_64()
+                                .max_w_full()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .child(
+                                            Icon::new(IconName::LoadCircle)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent)
+                                                .with_rotate_animation(2),
+                                        )
+                                        .child(Label::new("Preparing review")),
+                                )
+                                .child(
+                                    div().text_center().child(
+                                        Label::new(
+                                            "Checking out the source branch and loading changes…",
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    ),
+                                )
+                                .when_some(pending_review, |state, review| {
+                                    state.child(
+                                        div().w_full().text_center().child(
+                                            Label::new(format!(
+                                                "{}{} {}",
+                                                review.provider.request_prefix(),
+                                                review.number,
+                                                review.title
+                                            ))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .single_line()
+                                            .truncate(),
+                                        ),
+                                    )
+                                }),
+                        ),
+                )
+            })
             .map(|view| {
-                if let Some(session) = &self.session {
+                if checkout_in_progress {
+                    view
+                } else if let Some(session) = &self.session {
                     view.child(
                         div().px_2().pb_1().when(
                             self.review_service
@@ -1116,6 +1242,29 @@ mod tests {
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.session.as_ref().unwrap().item, diff)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.discussion_is_active(window, cx))
+        });
+        cx.deactivate_window();
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(!panel.discussion_is_active(window, cx))
+        });
+        cx.update(|window, _| window.activate_window());
+        let unrelated = cx.update(|window, cx| cx.new(|cx| Editor::single_line(window, cx)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(unrelated), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(!panel.discussion_is_active(window, cx))
+        });
+        panel.update_in(cx, |panel, window, cx| panel.open_diff(window, cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.discussion_is_active(window, cx))
         });
         let review = diff.read_with(cx, |diff, _| diff.review.clone());
         let editor_focus = diff.read_with(cx, |diff, cx| diff.editor(cx).read(cx).focus_handle(cx));

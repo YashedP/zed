@@ -125,7 +125,7 @@ pub(crate) fn repository_choice_from_remote(remote: &str) -> Option<ReviewReposi
     })
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct ReviewUser {
     pub login: String,
 }
@@ -251,7 +251,7 @@ pub(crate) enum CommentKind {
     Inline,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RemoteComment {
     #[serde(default)]
     pub thread: Option<Arc<ReviewThread>>,
@@ -275,13 +275,13 @@ pub(crate) struct RemoteComment {
     pub diff_hunk: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscussionComment {
     pub kind: CommentKind,
     pub comment: RemoteComment,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReviewThread {
     pub id: String,
@@ -294,7 +294,7 @@ pub(crate) struct ReviewThread {
     pub comments: Vec<ThreadComment>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ThreadComment {
     #[serde(
@@ -364,6 +364,56 @@ impl std::fmt::Display for ReviewProviderFailure {
 }
 impl std::error::Error for ReviewProviderFailure {}
 
+#[derive(Debug)]
+pub(crate) struct ReviewAuthenticationRequired;
+
+impl std::fmt::Display for ReviewAuthenticationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Review authentication is required")
+    }
+}
+impl std::error::Error for ReviewAuthenticationRequired {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscussionSnapshot {
+    pub comments: Vec<DiscussionComment>,
+    pub viewer: Option<String>,
+    pub permission_error: Option<String>,
+}
+
+impl DiscussionSnapshot {
+    fn normalize(&mut self) {
+        let mut threads = HashMap::new();
+        for entry in &mut self.comments {
+            if let Some(thread) = &mut entry.comment.thread {
+                *thread = threads
+                    .entry(thread.id.clone())
+                    .or_insert_with(|| {
+                        let mut normalized = (**thread).clone();
+                        normalized
+                            .comments
+                            .sort_by_key(|comment| comment.database_id);
+                        Arc::new(normalized)
+                    })
+                    .clone();
+            }
+        }
+        self.comments.sort_by(|a, b| {
+            a.comment
+                .created_at
+                .as_ref()
+                .or(a.comment.submitted_at.as_ref())
+                .cmp(
+                    &b.comment
+                        .created_at
+                        .as_ref()
+                        .or(b.comment.submitted_at.as_ref()),
+                )
+                .then_with(|| (a.kind as u8, a.comment.id).cmp(&(b.kind as u8, b.comment.id)))
+        });
+    }
+}
+
 pub(crate) struct GhCli {
     executor: gpui::BackgroundExecutor,
 }
@@ -399,7 +449,10 @@ impl GitHubTransport for GhCli {
                     } else if error.contains("HTTP 422") {
                         ("GitHub rejected this comment target. Refresh the PR and check the selected lines.", true)
                     } else { ("GitHub request failed. Refresh to check its outcome before retrying.", false) };
-                    return Err(ReviewProviderFailure { message: message.into(), outcome_unknown: writing && !known }.into());
+                    let failure = anyhow::Error::new(ReviewProviderFailure { message: message.into(), outcome_unknown: writing && !known });
+                    return Err(if error.contains("HTTP 401") || error.contains("gh auth login") {
+                        failure.context(ReviewAuthenticationRequired)
+                    } else { failure });
                 }
                 if request.method == ApiMethod::Delete && output.stdout.is_empty() { return Ok(Value::Null); }
                 serde_json::from_slice(&output.stdout).map_err(|_| ReviewProviderFailure { message: "GitHub returned an unreadable response. Refresh before retrying a post.".into(), outcome_unknown: writing }.into())
@@ -417,6 +470,11 @@ pub(crate) struct GitHubClient {
     transport: Arc<dyn GitHubTransport>,
 }
 impl GitHubClient {
+    #[cfg(test)]
+    pub(crate) fn with_transport(transport: Arc<dyn GitHubTransport>) -> Self {
+        Self { transport }
+    }
+
     pub fn new(executor: gpui::BackgroundExecutor) -> Self {
         Self {
             transport: Arc::new(GhCli { executor }),
@@ -460,22 +518,64 @@ impl ReviewClient {
         }
     }
 
-    pub(crate) async fn viewer(&self) -> Result<ReviewUser> {
-        match self {
-            Self::GitHub(client) => client.viewer().await,
-            Self::GitLab(client) => client.viewer().await,
-        }
-    }
-
-    pub(crate) async fn review_threads(
+    pub(crate) async fn discussion_snapshot(
         &self,
         repo: &ReviewRepository,
         number: u64,
-    ) -> Result<Vec<ReviewThread>> {
-        match self {
-            Self::GitHub(client) => client.review_threads(repo, number).await,
-            Self::GitLab(client) => client.review_threads(number).await,
-        }
+        cached_viewer: Option<String>,
+    ) -> Result<DiscussionSnapshot> {
+        let (viewer, permission_error) = match cached_viewer {
+            Some(viewer) => (Some(viewer), None),
+            None => {
+                let result = match self {
+                    Self::GitHub(client) => client.viewer().await,
+                    Self::GitLab(client) => client.viewer().await,
+                };
+                match result {
+                    Ok(viewer) => (Some(viewer.login), None),
+                    Err(error) if error.is::<ReviewAuthenticationRequired>() => return Err(error),
+                    Err(error) => (
+                        None,
+                        Some(format!("Comment permissions unavailable: {error}")),
+                    ),
+                }
+            }
+        };
+        let comments = match self {
+            Self::GitLab(client) => {
+                client
+                    .discussion_with_viewer(number, viewer.as_deref().unwrap_or_default())
+                    .await?
+            }
+            Self::GitHub(client) => {
+                let mut comments = client.discussion(repo, number).await?;
+                let threads = client.review_threads(repo, number).await?;
+                let by_comment: HashMap<_, _> = threads
+                    .into_iter()
+                    .flat_map(|thread| {
+                        let thread = Arc::new(thread);
+                        thread
+                            .comments
+                            .iter()
+                            .map(|comment| (comment.database_id, thread.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                for entry in &mut comments {
+                    if entry.kind == CommentKind::Inline {
+                        entry.comment.thread = by_comment.get(&entry.comment.id).cloned();
+                    }
+                }
+                comments
+            }
+        };
+        let mut snapshot = DiscussionSnapshot {
+            comments,
+            viewer,
+            permission_error,
+        };
+        snapshot.normalize();
+        Ok(snapshot)
     }
 
     pub(crate) async fn update_comment(
@@ -538,17 +638,6 @@ impl ReviewClient {
         match self {
             Self::GitHub(client) => client.pull_request(repo, number).await,
             Self::GitLab(client) => client.merge_request(repo, number).await,
-        }
-    }
-
-    pub(crate) async fn discussion(
-        &self,
-        repo: &ReviewRepository,
-        number: u64,
-    ) -> Result<Vec<DiscussionComment>> {
-        match self {
-            Self::GitHub(client) => client.discussion(repo, number).await,
-            Self::GitLab(client) => client.discussion(number).await,
         }
     }
 

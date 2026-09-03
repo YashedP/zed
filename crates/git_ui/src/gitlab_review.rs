@@ -138,11 +138,13 @@ impl GitLabTransport for GlabCli {
                             false,
                         )
                     };
-                    return Err(ReviewProviderFailure {
+                    let failure = anyhow::Error::new(ReviewProviderFailure {
                         message,
                         outcome_unknown: writing && !known,
-                    }
-                    .into());
+                    });
+                    return Err(if error.contains("401") || error.contains("authentication") || error.contains("auth login") {
+                        failure.context(crate::github_review::ReviewAuthenticationRequired)
+                    } else { failure });
                 }
                 if request.method == ApiMethod::Delete && output.stdout.is_empty() {
                     return Ok(Value::Null);
@@ -546,26 +548,15 @@ impl GitLabClient {
         result
     }
 
-    pub(crate) async fn discussion(&self, number: u64) -> Result<Vec<DiscussionComment>> {
-        let viewer = self.viewer().await?;
+    pub(crate) async fn discussion_with_viewer(
+        &self,
+        number: u64,
+        viewer: &str,
+    ) -> Result<Vec<DiscussionComment>> {
         Ok(Self::convert_discussions(
             self.discussions(number).await?,
-            &viewer.login,
+            viewer,
         ))
-    }
-
-    pub(crate) async fn review_threads(&self, number: u64) -> Result<Vec<ReviewThread>> {
-        let viewer = self.viewer().await?;
-        let converted = Self::convert_discussions(self.discussions(number).await?, &viewer.login);
-        let mut threads = std::collections::BTreeMap::new();
-        for entry in converted {
-            if let Some(thread) = entry.comment.thread {
-                threads
-                    .entry(thread.id.clone())
-                    .or_insert_with(|| (*thread).clone());
-            }
-        }
-        Ok(threads.into_values().collect())
     }
 
     async fn request(
@@ -951,6 +942,71 @@ mod tests {
             GitLabClient::with_transport(choice(), transport.clone()),
             transport,
         )
+    }
+
+    #[test]
+    fn discussion_snapshot_reuses_one_fetch_for_comments_threads_and_cached_viewer() {
+        smol::block_on(async {
+            let discussions = json!([{
+                "id": "discussion-1",
+                "notes": [{
+                    "id": 99,
+                    "body": "A reply",
+                    "author": {"username": "reviewer"},
+                    "system": false,
+                    "resolvable": true,
+                    "resolved": false,
+                    "position": {"new_path": "src/main.rs", "new_line": 12}
+                }, {
+                    "id": 100,
+                    "body": "Another reply",
+                    "author": {"username": "reviewer"},
+                    "system": false,
+                    "resolvable": true,
+                    "resolved": false,
+                    "position": {"new_path": "src/main.rs", "new_line": 12}
+                }]
+            }]);
+            let (client, transport) = client(vec![
+                Ok(json!({"username":"reviewer"})),
+                Ok(discussions.clone()),
+                Ok(discussions),
+            ]);
+            let client = crate::github_review::ReviewClient::GitLab(client);
+            let first = client
+                .discussion_snapshot(&repository(), 42, None)
+                .await
+                .unwrap();
+            let second = client
+                .discussion_snapshot(&repository(), 42, first.viewer.clone())
+                .await
+                .unwrap();
+            assert_eq!(first, second);
+            let thread = first.comments[0].comment.thread.as_ref().unwrap();
+            assert_eq!(thread.id, "discussion-1");
+            assert!(thread.comments[0].viewer_did_author);
+            assert!(
+                Arc::ptr_eq(thread, first.comments[1].comment.thread.as_ref().unwrap()),
+                "thread metadata must remain shared across replies"
+            );
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.endpoint == "user")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.endpoint.contains("/discussions?"))
+                    .count(),
+                2
+            );
+            assert!(requests.iter().all(|request| !request.writing));
+        });
     }
 
     #[test]
