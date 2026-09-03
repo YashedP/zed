@@ -10,8 +10,8 @@ use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::DiffHunkStatus;
 use editor::{
-    Addon, DiffHunkDelegate, Editor, EditorEvent, ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate,
-    SplittableEditor, actions::SendReviewToAgent,
+    Addon, DiffHunkRenderer, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
+    actions::SendReviewToAgent,
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
@@ -135,39 +135,11 @@ impl Addon for BranchDiffAddon {
     }
 }
 
-struct BranchReviewDiffHunkDelegate {
+struct BranchReviewDiffHunkRenderer {
     review: WeakEntity<crate::branch_review::BranchReview>,
 }
 
-impl DiffHunkDelegate for BranchReviewDiffHunkDelegate {
-    fn toggle(
-        &self,
-        _: Vec<ResolvedDiffHunks>,
-        _: &mut Editor,
-        _: &mut Window,
-        _: &mut gpui::Context<Editor>,
-    ) {
-    }
-
-    fn stage_or_unstage(
-        &self,
-        _: bool,
-        _: Vec<ResolvedDiffHunks>,
-        _: &mut Editor,
-        _: &mut Window,
-        _: &mut gpui::Context<Editor>,
-    ) {
-    }
-
-    fn restore(
-        &self,
-        _: Vec<ResolvedDiffHunks>,
-        _: &mut Editor,
-        _: &mut Window,
-        _: &mut gpui::Context<Editor>,
-    ) {
-    }
-
+impl DiffHunkRenderer for BranchReviewDiffHunkRenderer {
     fn render_hunk_controls(
         &self,
         _: u32,
@@ -484,7 +456,7 @@ impl BranchDiff {
                 Capability::ReadWrite,
                 "No changes",
                 move |editor, cx| {
-                    editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+                    editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, _cx| {
                         rhs_editor.set_read_only(false);
                         rhs_editor.register_addon(BranchDiffAddon {
@@ -520,8 +492,8 @@ impl BranchDiff {
         );
         let editor = diff.read(cx).editor().clone();
         editor.update(cx, |split, cx| {
-            split.set_diff_hunk_delegate(
-                Some(Arc::new(BranchReviewDiffHunkDelegate {
+            split.set_diff_hunk_renderer(
+                Some(Arc::new(BranchReviewDiffHunkRenderer {
                     review: review.downgrade(),
                 })),
                 cx,

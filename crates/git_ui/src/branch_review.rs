@@ -3345,6 +3345,17 @@ mod tests {
                 .remote_id()
         });
         let editor = diff.read_with(cx, |diff, cx| diff.editor(cx));
+        editor.update_in(cx, |editor, window, cx| editor.split(window, cx));
+        cx.run_until_parked();
+        let lhs = editor.read_with(cx, |editor, _| editor.lhs_editor().unwrap().clone());
+        let base_buffer_id = review.read_with(cx, |review, cx| {
+            let diff = review.entries[&modified].diff.as_ref().unwrap().read(cx);
+            assert!(
+                diff.operations().is_none(),
+                "review diffs must not stage or restore"
+            );
+            diff.base_text_buffer().read(cx).remote_id()
+        });
         let rhs = editor.read_with(cx, |editor, _| editor.rhs_editor().clone());
         assert!(!rhs.read_with(cx, |editor, cx| { editor.is_buffer_folded(buffer_id, cx) }));
 
@@ -3357,7 +3368,7 @@ mod tests {
         assert!(rhs.read_with(cx, |editor, cx| { editor.is_buffer_folded(buffer_id, cx) }));
         assert!(rhs.read_with(cx, |editor, cx| {
             editor
-                .diff_hunk_delegate()
+                .diff_hunk_renderer()
                 .render_hunk_hollow(
                     &buffer_diff::DiffHunkStatus::modified_none(),
                     Some(buffer_id),
@@ -3372,6 +3383,19 @@ mod tests {
         }
         cx.run_until_parked();
 
+        lhs.read_with(cx, |editor, cx| {
+            let renderer = editor.diff_hunk_renderer();
+            let status = buffer_diff::DiffHunkStatus::modified_none();
+            assert_eq!(
+                renderer.render_hunk_hollow(&status, Some(base_buffer_id), cx),
+                Some(true)
+            );
+            assert_eq!(
+                renderer.render_diff_row_hollow(&status, Some(base_buffer_id), Some(0), cx),
+                Some(true)
+            );
+        });
+
         review.update_in(cx, |review, window, cx| {
             assert_eq!(
                 review.toggle_viewed_from_ui(&modified, window, cx),
@@ -3381,7 +3405,7 @@ mod tests {
         assert!(rhs.read_with(cx, |editor, cx| { editor.is_buffer_folded(buffer_id, cx) }));
         assert!(!rhs.read_with(cx, |editor, cx| {
             editor
-                .diff_hunk_delegate()
+                .diff_hunk_renderer()
                 .render_hunk_hollow(
                     &buffer_diff::DiffHunkStatus::modified_none(),
                     Some(buffer_id),

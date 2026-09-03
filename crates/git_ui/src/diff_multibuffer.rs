@@ -4,7 +4,7 @@ use crate::{
     git_panel_settings::GitPanelSettings,
 };
 use anyhow::Result;
-use buffer_diff::{BufferDiff, DiffBaseKind};
+use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
     EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
@@ -871,15 +871,7 @@ impl DiffMultibuffer {
                     let language_registry =
                         display_buffer.read_with(cx, |buffer, _| buffer.language_registry());
                     let custom_diff = cx.update(|_window, cx| {
-                        cx.new(|cx| {
-                            BufferDiff::new(
-                                &snapshot,
-                                language,
-                                language_registry,
-                                DiffBaseKind::Custom,
-                                cx,
-                            )
-                        })
+                        cx.new(|cx| BufferDiff::new(&snapshot, language, language_registry, cx))
                     })?;
                     custom_diff
                         .update(cx, |diff, cx| {

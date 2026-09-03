@@ -278,6 +278,13 @@ impl EditorElement {
 
         crate::rust_analyzer_ext::apply_related_actions(editor, window, cx);
         crate::clangd_ext::apply_related_actions(editor, window, cx);
+        crate::emmet_ext::apply_related_actions(editor, window, cx);
+
+        if editor.read(cx).pending_inline_input().is_some() {
+            register_action(editor, window, |editor, _: &menu::Confirm, window, cx| {
+                editor.confirm_inline_input(window, cx);
+            });
+        }
 
         register_action(editor, window, Editor::open_context_menu);
         register_action(editor, window, Editor::move_left);
@@ -4666,7 +4673,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (Vec<AnyElement>, Vec<(DisplayRow, Bounds<Pixels>)>) {
-        let diff_hunk_delegate = editor.read(cx).diff_hunk_delegate();
+        let diff_hunk_renderer = editor.read(cx).diff_hunk_renderer();
         let hovered_diff_hunk_row = editor.read(cx).hovered_diff_hunk_row;
         let sticky_top = text_hitbox.bounds.top() + sticky_header_height;
 
@@ -4738,7 +4745,7 @@ impl EditorElement {
                         sticky_top.min(max_y)
                     };
 
-                    let mut element = diff_hunk_delegate.render_hunk_controls(
+                    let mut element = diff_hunk_renderer.render_hunk_controls(
                         display_row_range.start.0,
                         status,
                         multi_buffer_range.clone(),
@@ -5255,7 +5262,7 @@ impl EditorElement {
                             }
                         },
                     };
-                    let delegate = self.editor.read(cx).diff_hunk_delegate();
+                    let renderer = self.editor.read(cx).diff_hunk_renderer();
                     let visible_start = display_row_range
                         .start
                         .max(layout.position_map.visible_row_range.start);
@@ -5270,7 +5277,7 @@ impl EditorElement {
                     let mut row_infos = layout.position_map.snapshot.row_infos(visible_start);
                     let first_row_info = row_infos.next();
                     let first_override = first_row_info.as_ref().and_then(|row_info| {
-                        delegate.render_diff_row_hollow(
+                        renderer.render_diff_row_hollow(
                             status,
                             row_info.buffer_id,
                             row_info.buffer_row.or(row_info.wrapped_buffer_row),
@@ -5303,7 +5310,7 @@ impl EditorElement {
                                 (first_row_offset + index as u32 + 1, row_info)
                             })
                         {
-                            let hollow = delegate
+                            let hollow = renderer
                                 .render_diff_row_hollow(
                                     status,
                                     row_info.buffer_id,
@@ -6781,11 +6788,11 @@ impl EditorElement {
         buffer_id: Option<BufferId>,
         cx: &mut App,
     ) -> bool {
-        let delegate = self.editor.read(cx).diff_hunk_delegate();
-        if let Some(hollow) = delegate.render_hunk_hollow(&status, buffer_id, cx) {
+        let renderer = self.editor.read(cx).diff_hunk_renderer();
+        if let Some(hollow) = renderer.render_hunk_hollow(&status, buffer_id, cx) {
             return hollow;
         }
-        let unstaged = !delegate.render_hunk_as_staged(&status, cx);
+        let unstaged = !renderer.render_hunk_as_staged(&status, cx);
         let unstaged_hollow = matches!(
             ProjectSettings::get_global(cx).git.hunk_style,
             GitHunkStyleSetting::UnstagedHollow
@@ -6801,8 +6808,8 @@ impl EditorElement {
         buffer_row: Option<u32>,
         cx: &mut App,
     ) -> bool {
-        let delegate = self.editor.read(cx).diff_hunk_delegate();
-        delegate
+        let renderer = self.editor.read(cx).diff_hunk_renderer();
+        renderer
             .render_diff_row_hollow(&status, buffer_id, buffer_row, cx)
             .unwrap_or_else(|| self.diff_hunk_hollow(status, buffer_id, cx))
     }
@@ -8403,9 +8410,13 @@ impl Element for EditorElement {
                         )
                     };
 
-                    let mut highlighted_rows = self
-                        .editor
-                        .update(cx, |editor, cx| editor.highlighted_display_rows(window, cx));
+                    let mut highlighted_rows =
+                        self.editor.read(cx).highlighted_display_rows_in_range(
+                            start_anchor..end_anchor,
+                            start_row..end_row,
+                            &snapshot.display_snapshot,
+                            cx,
+                        );
 
                     let mut highlighted_ranges = self
                         .editor_with_selections(cx)
@@ -9251,7 +9262,8 @@ impl Element for EditorElement {
                         cx,
                     );
 
-                    let frozen_scroll_state = if self.editor.read(cx).scroll_range_hold.is_some() {
+                    let frozen_scroll_state = if self.editor.read(cx).search_results_hold.is_some()
+                    {
                         let is_rewrapping =
                             self.editor.read(cx).display_map.read(cx).is_rewrapping(cx);
                         self.editor.update(cx, |editor, _| {
@@ -9586,7 +9598,7 @@ impl Element for EditorElement {
                     };
 
                     let (diff_hunk_controls, diff_hunk_control_bounds) =
-                        if is_read_only && self.editor.read(cx).diff_hunk_delegate.is_none() {
+                        if is_read_only && self.editor.read(cx).diff_hunk_renderer.is_none() {
                             (vec![], vec![])
                         } else {
                             self.layout_diff_hunk_controls(
