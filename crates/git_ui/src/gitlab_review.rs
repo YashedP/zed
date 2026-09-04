@@ -279,7 +279,10 @@ impl GitLabClient {
     }
 
     #[cfg(test)]
-    fn with_transport(choice: ReviewRepositoryChoice, transport: Arc<dyn GitLabTransport>) -> Self {
+    pub(crate) fn with_transport(
+        choice: ReviewRepositoryChoice,
+        transport: Arc<dyn GitLabTransport>,
+    ) -> Self {
         Self { transport, choice }
     }
 

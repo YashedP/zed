@@ -196,6 +196,8 @@ fn review_picker_empty_message(
 }
 
 pub(crate) enum ReviewServiceEvent {
+    Opening,
+    OpenFailed(String),
     Open {
         repository: ReviewRepository,
         request: ReviewRequest,
@@ -226,17 +228,17 @@ impl ReviewRequestPicker {
         let picker_for_subscription = picker.clone();
         let review_subscription = cx.observe_in(&review, window, move |_, review, window, cx| {
             let review = review.read(cx);
-            let requests = review.request_summaries().to_vec();
+            let requests = review.request_summaries_for_provider(provider).to_vec();
             let repositories = repositories_for_provider(&review.choices, provider);
-            let selected_repositorysitory = review.saved.repository.clone();
-            let busy = review.busy;
+            let selected_repository_id = review.saved.repository.clone();
+            let busy = review.picker_busy();
             let requests_loaded = review.requests_loaded;
             let error = review.error.clone();
             picker_for_subscription.update(cx, |picker, cx| {
                 picker.delegate.set_requests(requests);
                 picker
                     .delegate
-                    .set_repositories(repositories, selected_repositorysitory);
+                    .set_repositories(repositories, selected_repository_id);
                 picker.delegate.set_status(busy, requests_loaded, error);
                 picker.refresh(window, cx);
             });
@@ -268,7 +270,7 @@ struct ReviewRequestPickerDelegate {
     review: WeakEntity<ReviewService>,
     provider: ReviewProviderKind,
     repositories: Vec<ReviewRepositoryChoice>,
-    selected_repositorysitory: Option<String>,
+    selected_repository_id: Option<String>,
     requests: Vec<ReviewRequestSummary>,
     matches: Vec<StringMatch>,
     selected_index: usize,
@@ -283,17 +285,17 @@ impl ReviewRequestPickerDelegate {
         provider: ReviewProviderKind,
         state: &ReviewService,
     ) -> Self {
-        let requests = state.request_summaries().to_vec();
+        let requests = state.request_summaries_for_provider(provider).to_vec();
         let matches = Self::all_matches(&requests, provider);
         Self {
             review,
             provider,
             repositories: repositories_for_provider(&state.choices, provider),
-            selected_repositorysitory: state.saved.repository.clone(),
+            selected_repository_id: state.saved.repository.clone(),
             requests,
             matches,
             selected_index: 0,
-            busy: state.busy,
+            busy: state.picker_busy(),
             loaded: state.requests_loaded,
             error: state.error.clone(),
         }
@@ -331,10 +333,10 @@ impl ReviewRequestPickerDelegate {
     fn set_repositories(
         &mut self,
         repositories: Vec<ReviewRepositoryChoice>,
-        selected_repositorysitory: Option<String>,
+        selected_repository_id: Option<String>,
     ) {
         self.repositories = repositories;
-        self.selected_repositorysitory = selected_repositorysitory;
+        self.selected_repository_id = selected_repository_id;
     }
 
     fn set_status(&mut self, busy: bool, loaded: bool, error: Option<String>) {
@@ -352,9 +354,26 @@ impl PickerDelegate for ReviewRequestPickerDelegate {
     }
 
     fn render_header(&self, _: &mut Window, _: &mut Context<Picker<Self>>) -> Option<AnyElement> {
-        (self.repositories.len() > 1 || self.error.is_some()).then(|| {
+        (self.repositories.len() > 1 || self.error.is_some() || self.busy).then(|| {
             v_flex()
                 .id("review-request-picker-header")
+                .when(self.busy, |header| {
+                    header.child(
+                        h_flex()
+                            .p_2()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Small)
+                                    .with_rotate_animation(2),
+                            )
+                            .child(
+                                Label::new("Loading reviews…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                })
                 .w_full()
                 .when(self.repositories.len() > 1, |header| {
                     header.child(
@@ -368,7 +387,7 @@ impl PickerDelegate for ReviewRequestPickerDelegate {
                                 |(index, repository)| {
                                     let repository_id = repository.storage_id();
                                     let selected = self
-                                        .selected_repositorysitory
+                                        .selected_repository_id
                                         .as_ref()
                                         .is_some_and(|selected| selected == &repository_id);
                                     let review = self.review.clone();
@@ -489,12 +508,25 @@ impl PickerDelegate for ReviewRequestPickerDelegate {
         else {
             return;
         };
-        self.review
-            .update(cx, |review, cx| {
-                review.open_request(request.number, window, cx)
-            })
-            .log_err();
-        cx.emit(DismissEvent);
+        let Some(repository_id) = self.selected_repository_id.clone() else {
+            return;
+        };
+        let selection = ReviewSelection {
+            provider: self.provider,
+            repository_id,
+            number: request.number,
+        };
+        let accepted = self
+            .review
+            .update(cx, |review, cx| review.open_request(selection, window, cx));
+        match accepted {
+            Ok(true) => cx.emit(DismissEvent),
+            Ok(false) => {}
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
     }
 
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -525,6 +557,7 @@ impl PickerDelegate for ReviewRequestPickerDelegate {
                 )))
                 .child(
                     h_flex()
+                        .debug_selector(|| "review-request-row".into())
                         .w_full()
                         .min_w_0()
                         .gap_1()
@@ -640,6 +673,21 @@ struct DiscussionRefresh {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewSelection {
+    provider: ReviewProviderKind,
+    repository_id: String,
+    number: u64,
+}
+
+#[derive(Default)]
+enum PickerOperation {
+    #[default]
+    Idle,
+    Listing,
+    Opening(ReviewSelection),
+}
+
 pub(crate) struct ReviewService {
     project: Entity<Project>,
     review: Option<gpui::WeakEntity<crate::branch_review::BranchReview>>,
@@ -670,7 +718,7 @@ pub(crate) struct ReviewService {
     target: CommentTarget,
     state: &'static str,
     page: u32,
-    busy: bool,
+    picker_operation: PickerOperation,
     posting: bool,
     detached: bool,
     reconciled: bool,
@@ -781,7 +829,7 @@ impl ReviewService {
             target: CommentTarget::General,
             state: "open",
             page: 1,
-            busy: false,
+            picker_operation: PickerOperation::Idle,
             posting: false,
             detached: true,
             reconciled: false,
@@ -823,7 +871,7 @@ impl ReviewService {
         }
         self.generation += 1;
         self.task = None;
-        self.busy = false;
+        self.picker_operation = PickerOperation::Idle;
         self.reset_discussion_refresh();
         self.repository = repository;
         self.root = root;
@@ -955,7 +1003,7 @@ impl ReviewService {
                             this.saved.repository = canonical_selection;
                             this.generation += 1;
                             this.task = None;
-                            this.busy = false;
+                            this.picker_operation = PickerOperation::Idle;
                             this.client = None;
                             this.selected_repository = None;
                             this.preview = None;
@@ -1002,7 +1050,11 @@ impl ReviewService {
         }
         self.remove_inline_composer(true, cx);
         self.save_draft(cx);
-        self.generation += 1;
+        if !self.posting {
+            self.generation += 1;
+            self.task = None;
+            self.picker_operation = PickerOperation::Idle;
+        }
         self.selected_repository = Some(checkout.repository.clone());
         self.active_provider = Some(checkout.repository.provider);
         if self.client.is_none()
@@ -1055,12 +1107,17 @@ impl ReviewService {
         if !self.posting {
             self.generation += 1;
             self.task = None;
-            self.busy = false;
+            self.picker_operation = PickerOperation::Idle;
         }
         cx.notify();
     }
 
     pub fn detach(&mut self, cx: &mut Context<Self>) {
+        if !self.posting {
+            self.generation += 1;
+            self.task = None;
+            self.picker_operation = PickerOperation::Idle;
+        }
         self.reset_discussion_refresh();
         self.remove_inline_composer(true, cx);
         self.detached = true;
@@ -1072,6 +1129,12 @@ impl ReviewService {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.posting {
+            self.error =
+                Some("Wait for the current review post to finish before loading reviews".into());
+            cx.notify();
+            return;
+        }
         let canonical_repository =
             repository_for_provider(&self.choices, self.saved.repository.as_deref(), provider);
         let selection_changed =
@@ -1082,7 +1145,7 @@ impl ReviewService {
             self.active_provider = Some(provider);
             self.generation += 1;
             self.task = None;
-            self.busy = false;
+            self.picker_operation = PickerOperation::Idle;
             self.requests.clear();
             self.requests_loaded = false;
             self.preview = None;
@@ -1117,6 +1180,9 @@ impl ReviewService {
         if self.posting || self.saved.repository.as_deref() == Some(repository_id.as_str()) {
             return;
         }
+        self.generation += 1;
+        self.task = None;
+        self.picker_operation = PickerOperation::Idle;
         self.save_draft(cx);
         self.saved.repository = Some(repository_id);
         self.active_provider = Some(provider);
@@ -1412,7 +1478,7 @@ impl ReviewService {
             preview.0 = body;
         }
         let preview = preview.1.clone();
-        let pending = self.busy || self.discussion_refresh.refreshing || self.posting;
+        let pending = self.picker_busy() || self.discussion_refresh.refreshing || self.posting;
         let unknown = self.draft().is_some_and(|draft| draft.outcome_unknown);
         let target = target_label(&self.target);
         let provider_name = self.identity().name;
@@ -1495,7 +1561,7 @@ impl ReviewService {
     }
 
     fn search(&mut self, cx: &mut Context<Self>) {
-        if self.posting {
+        if self.posting || self.is_opening_request() {
             return;
         }
         let Some(saved) = self.saved.repository.clone() else {
@@ -1516,17 +1582,20 @@ impl ReviewService {
             cx.notify();
             return;
         };
-        let Some(root) = self.root.clone() else {
-            return;
+        let client = match self.client_for_choice(&choice, cx) {
+            Ok(client) => client,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
         };
         self.generation += 1;
         let generation = self.generation;
-        self.busy = true;
+        self.picker_operation = PickerOperation::Listing;
         self.requests_loaded = false;
         self.error = None;
         self.preview = None;
-        let client =
-            ReviewClient::for_choice(choice.clone(), root, cx.background_executor().clone());
         let query = self.query.read(cx).text(cx);
         let state = self.state;
         let page = self.page;
@@ -1564,7 +1633,7 @@ impl ReviewService {
                 if generation != this.generation {
                     return;
                 }
-                this.busy = false;
+                this.picker_operation = PickerOperation::Idle;
                 match result {
                     Ok((client, repo, requests, _next)) => {
                         this.client = Some(client);
@@ -1590,46 +1659,117 @@ impl ReviewService {
         cx.notify();
     }
 
-    fn open_request(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.posting || self.busy {
-            return;
+    fn request_summaries_for_provider(
+        &self,
+        provider: ReviewProviderKind,
+    ) -> &[ReviewRequestSummary] {
+        if self.active_provider == Some(provider) {
+            self.request_summaries()
+        } else {
+            &[]
         }
-        let Some(repository) = self.selected_repository.clone() else {
-            self.error = Some("Select a review repository first".into());
+    }
+
+    fn picker_busy(&self) -> bool {
+        !matches!(self.picker_operation, PickerOperation::Idle)
+    }
+
+    pub(crate) fn is_opening_request(&self) -> bool {
+        matches!(self.picker_operation, PickerOperation::Opening(_))
+    }
+
+    fn selection_is_current(&self, selection: &ReviewSelection) -> bool {
+        self.active_provider == Some(selection.provider)
+            && self.saved.repository.as_deref() == Some(selection.repository_id.as_str())
+    }
+
+    fn client_for_choice(&self, choice: &ReviewRepositoryChoice, cx: &App) -> Result<ReviewClient> {
+        if let (Some(client), Some(repository)) = (&self.client, &self.selected_repository)
+            && repository.provider == choice.provider
+            && repository.host == choice.host
+            && repository.full_name == choice.full_name
+        {
+            return Ok(client.clone());
+        }
+        Ok(ReviewClient::for_choice(
+            choice.clone(),
+            self.root.clone().context("Open a repository first")?,
+            cx.background_executor().clone(),
+        ))
+    }
+
+    fn open_request(
+        &mut self,
+        selection: ReviewSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.posting {
+            self.error =
+                Some("Wait for the current review post to finish before opening a review".into());
             cx.notify();
-            return;
+            return false;
+        }
+        if self.is_opening_request() {
+            cx.notify();
+            return false;
+        }
+        let choice =
+            repository_choice_by_id(&self.choices, &selection.repository_id, selection.provider);
+        let Some(choice) = choice.filter(|_| self.selection_is_current(&selection)) else {
+            self.error = Some(
+                "The review repository changed. Select a review from the current repository."
+                    .into(),
+            );
+            cx.notify();
+            return false;
         };
-        let Some(client) = self.client.clone() else {
-            self.error = Some("Reload the review list before opening a review".into());
-            cx.notify();
-            return;
+        let client = match self.client_for_choice(&choice, cx) {
+            Ok(client) => client,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+                return false;
+            }
         };
         self.generation += 1;
         let generation = self.generation;
-        self.busy = true;
+        self.task = None;
+        self.picker_operation = PickerOperation::Opening(selection.clone());
+        self.error = None;
+        cx.emit(ReviewServiceEvent::Opening);
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = client.review_request(&repository, number).await;
+            let result: Result<_> = async {
+                let repository = client.repository(&choice).await?;
+                let request = client.review_request(&repository, selection.number).await?;
+                Ok((repository, request))
+            }.await;
             this.update(cx, |this, cx| {
-                if generation != this.generation {
+                if generation != this.generation || !this.selection_is_current(&selection)
+                    || !matches!(&this.picker_operation, PickerOperation::Opening(current) if *current == selection) {
                     return;
                 }
-                this.busy = false;
+                this.picker_operation = PickerOperation::Idle;
+                this.task = None;
                 match result {
-                    Ok(request) => {
+                    Ok((repository, request)) => {
+                        this.client = Some(client);
+                        this.selected_repository = Some(repository.clone());
                         this.preview = Some(request.clone());
                         this.error = None;
-                        cx.emit(ReviewServiceEvent::Open {
-                            repository,
-                            request,
-                        });
+                        cx.emit(ReviewServiceEvent::Open { repository, request });
                     }
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        this.error = Some(error.clone());
+                        cx.emit(ReviewServiceEvent::OpenFailed(error));
+                    }
                 }
                 cx.notify();
-            })
-            .log_err();
+            }).log_err();
         }));
         cx.notify();
+        true
     }
 
     fn reset_discussion_refresh(&mut self) {
@@ -1679,7 +1819,11 @@ impl ReviewService {
         ButtonLike::new("refresh-review-comments")
             .aria_label("Refresh comments")
             .disabled(
-                checkout_in_progress || refreshing || self.busy || self.posting || self.detached,
+                checkout_in_progress
+                    || refreshing
+                    || self.picker_busy()
+                    || self.posting
+                    || self.detached,
             )
             .tooltip(Tooltip::text(tooltip))
             .child(if refreshing {
@@ -1919,7 +2063,7 @@ impl ReviewService {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.posting || self.busy {
+        if self.posting || self.picker_busy() {
             return;
         }
         self.select_target(
@@ -1955,7 +2099,7 @@ impl ReviewService {
     }
 
     fn run_discussion_action(&mut self, action: DiscussionAction, cx: &mut Context<Self>) {
-        if self.busy
+        if self.picker_busy()
             || self.discussion_refresh.refreshing
             || self.posting
             || self.detached
@@ -2130,7 +2274,7 @@ impl ReviewService {
             });
             groups[index].push(entry.clone());
         }
-        let pending = self.busy
+        let pending = self.picker_busy()
             || self.discussion_refresh.refreshing
             || self.posting
             || self.detached
@@ -2411,7 +2555,7 @@ impl ReviewService {
 
     fn post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.posting
-            || self.busy
+            || self.picker_busy()
             || self.discussion_refresh.refreshing
             || self.detached
             || self.load_failed
@@ -2688,7 +2832,7 @@ impl Render for ReviewService {
         let unknown_action = self
             .action_key()
             .is_some_and(|key| self.saved.pending_actions.contains_key(&key));
-        let pending = self.busy || self.discussion_refresh.refreshing || self.posting;
+        let pending = self.picker_busy() || self.discussion_refresh.refreshing || self.posting;
         let unknown = self.draft().is_some_and(|draft| draft.outcome_unknown);
         let provider_name = self.identity().name;
         container
@@ -2986,6 +3130,20 @@ mod tests {
             let version = self.version.load(std::sync::atomic::Ordering::SeqCst);
             let value = if request.endpoint == "user" {
                 json!({"login": "reviewer"})
+            } else if request.endpoint == "projects/owner%2Fproject" {
+                json!({"id":42,"path_with_namespace":"owner/project","web_url":"https://gitlab.com/owner/project"})
+            } else if request.endpoint.ends_with("/merge_requests/1") {
+                json!({"iid":1,"title":"Fixture","state":"opened","author":{"username":"author"},
+                    "source_branch":"feature","target_branch":"main","sha":"a".repeat(40),
+                    "source_project_id":42,"target_project_id":42,
+                    "diff_refs":{"base_sha":"b".repeat(40),"head_sha":"a".repeat(40),"start_sha":"b".repeat(40)},
+                    "web_url":"https://gitlab.com/owner/project/-/merge_requests/1"})
+            } else if request.endpoint.contains("/merge_requests?") {
+                json!([{"iid":1,"title":"Fixture"}])
+            } else if request.endpoint == "repos/owner/project" {
+                serde_json::to_value(checkout(1).repository).unwrap()
+            } else if request.endpoint.starts_with("repos/owner/project/pulls?") {
+                json!([checkout(1).pull_request])
             } else if request.endpoint == "graphql" {
                 json!({"data":{"repository":{"pullRequest":{"reviewThreads":{
                     "nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}
@@ -3011,6 +3169,15 @@ mod tests {
                 Ok(value)
             }
             .boxed()
+        }
+    }
+
+    impl crate::gitlab_review::GitLabTransport for PollingTransport {
+        fn request(
+            &self,
+            request: github_review::ApiRequest,
+        ) -> futures::future::BoxFuture<'static, Result<serde_json::Value>> {
+            github_review::GitHubTransport::request(self, request)
         }
     }
 
@@ -3041,6 +3208,204 @@ mod tests {
             ));
         });
         (view, cx, transport)
+    }
+
+    #[gpui::test]
+    async fn cached_picker_selection_retries_during_list_refresh(cx: &mut TestAppContext) {
+        assert_picker_retry(cx, ReviewProviderKind::GitHub).await;
+    }
+
+    #[gpui::test]
+    async fn gitlab_cached_picker_selection_retries_during_list_refresh(cx: &mut TestAppContext) {
+        assert_picker_retry(cx, ReviewProviderKind::GitLab).await;
+    }
+
+    async fn assert_picker_retry(cx: &mut TestAppContext, provider: ReviewProviderKind) {
+        let (view, cx, transport) = polling_service(cx).await;
+        let choice = ReviewRepositoryChoice {
+            provider,
+            host: if provider == ReviewProviderKind::GitHub {
+                "github.com"
+            } else {
+                "gitlab.com"
+            }
+            .into(),
+            full_name: "owner/project".into(),
+            remote_url: "unused in mock".into(),
+        };
+        let selection = ReviewSelection {
+            provider,
+            repository_id: choice.storage_id(),
+            number: 1,
+        };
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = opens.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, ReviewServiceEvent::Open { .. }) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        view.update(cx, |view, _| {
+            view.saved.drafts.insert(
+                "preserved-draft".into(),
+                CommentDraft {
+                    original_body: None,
+                    target: CommentTarget::General,
+                    body: "Keep this draft".into(),
+                    outcome_unknown: true,
+                },
+            );
+            view.active_provider = Some(provider);
+            view.selected_repository.as_mut().unwrap().provider = provider;
+            view.selected_repository.as_mut().unwrap().host = choice.host.clone();
+            view.client = Some(match provider {
+                ReviewProviderKind::GitHub => ReviewClient::GitHub(
+                    github_review::GitHubClient::with_transport(transport.clone()),
+                ),
+                ReviewProviderKind::GitLab => {
+                    ReviewClient::GitLab(crate::gitlab_review::GitLabClient::with_transport(
+                        choice.clone(),
+                        transport.clone(),
+                    ))
+                }
+            });
+            view.choices = vec![choice.clone()];
+            view.saved.repository = Some(choice.storage_id());
+            view.requests = vec![ReviewRequestSummary {
+                number: 1,
+                title: "Fixture".into(),
+            }];
+            view.requests_loaded = true;
+        });
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.open_request(selection.clone(), window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(opens.get(), 1);
+        // The checkout warning must not prevent a later selection, including while
+        // a fresh list request is still waiting on the provider.
+        let (list_sender, list_receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(list_receiver);
+        view.update(cx, |view, cx| {
+            view.error = Some("Commit or stash working changes before opening a review".into());
+            view.search(cx);
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| matches!(
+            view.picker_operation,
+            PickerOperation::Listing
+        )));
+        let picker = cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| {
+                ReviewRequestPicker::new(view.clone(), provider, window, cx)
+            })
+        });
+        let dismissals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = dismissals.clone();
+        let _dismiss = cx.update(|_, cx| {
+            cx.subscribe(&picker, move |_, _: &DismissEvent, _| {
+                observed.set(observed.get() + 1)
+            })
+        });
+        let inner = picker.read_with(cx, |picker, _| picker.picker.clone());
+        let (detail_sender, detail_receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(detail_receiver);
+        inner.update_in(cx, |picker, window, cx| picker.focus(window, cx));
+        cx.run_until_parked();
+        if provider == ReviewProviderKind::GitHub {
+            cx.dispatch_action(menu::Confirm);
+        } else {
+            let row = cx
+                .debug_bounds("review-request-row")
+                .expect("cached request row");
+            cx.simulate_click(row.center(), gpui::Modifiers::default());
+        }
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 1);
+        assert!(
+            list_sender.send(()).is_err(),
+            "explicit selection cancels list refresh"
+        );
+        assert!(view.read_with(cx, |view, _| view.is_opening_request()));
+        inner.update_in(cx, |picker, window, cx| {
+            picker.delegate.confirm(false, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(dismissals.get(), 1, "rejected duplicate must not dismiss");
+        detail_sender.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(opens.get(), 2, "cached selection must retry checkout");
+        let endpoint = if provider == ReviewProviderKind::GitHub {
+            "/pulls/1"
+        } else {
+            "/merge_requests/1"
+        };
+        assert_eq!(transport.count(endpoint), 2);
+        assert!(!view.read_with(cx, |view, _| view.picker_busy()));
+
+        let mut wrong_scope = selection.clone();
+        wrong_scope.repository_id = "GitHub:other.example/owner/project".into();
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.open_request(wrong_scope, window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(transport.count(endpoint), 2);
+
+        transport.failures.lock().unwrap().push_back(false);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.open_request(selection.clone(), window, cx))
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.error.is_some() && !view.picker_busy()));
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.open_request(selection.clone(), window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(opens.get(), 3, "failed metadata loads remain retryable");
+
+        let (stale_sender, stale_receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(stale_receiver);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.open_request(selection, window, cx))
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.detach(cx));
+        cx.run_until_parked();
+        assert!(stale_sender.send(()).is_err());
+        assert_eq!(opens.get(), 3);
+        assert!(!view.read_with(cx, |view, _| view.picker_busy()));
+        assert!(view.read_with(cx, |view, _| {
+            let draft = &view.saved.drafts["preserved-draft"];
+            draft.body == "Keep this draft" && draft.outcome_unknown
+        }));
+
+        let (stale_sender, stale_receiver) = futures::channel::oneshot::channel();
+        *transport.gate.lock().unwrap() = Some(stale_receiver);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.open_request(
+                ReviewSelection {
+                    provider,
+                    repository_id: choice.storage_id(),
+                    number: 1,
+                },
+                window,
+                cx
+            ));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let mut other = choice.clone();
+            other.full_name = "owner/other".into();
+            let id = other.storage_id();
+            view.choices.push(other);
+            view.select_repository(id, cx);
+            assert!(!view.is_opening_request());
+        });
+        cx.run_until_parked();
+        assert!(stale_sender.send(()).is_err());
+        assert_eq!(opens.get(), 3, "repository switch rejects old details");
     }
 
     #[gpui::test]

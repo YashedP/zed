@@ -202,6 +202,15 @@ impl BranchReviewPanel {
                 &review_service,
                 window,
                 |this, _, event, window, cx| match event {
+                    ReviewServiceEvent::Opening => {
+                        this.error = None;
+                        this.warning = None;
+                        cx.notify();
+                    }
+                    ReviewServiceEvent::OpenFailed(error) => {
+                        this.error = Some(error.clone());
+                        cx.notify();
+                    }
                     ReviewServiceEvent::Open {
                         repository,
                         request,
@@ -817,7 +826,8 @@ impl Render for BranchReviewPanel {
         let checkout_in_progress = self
             .checkout_task
             .as_ref()
-            .is_some_and(|task| !task.is_ready());
+            .is_some_and(|task| !task.is_ready())
+            || self.review_service.read(cx).is_opening_request();
         let pending_review = self.pending_review.clone();
         let has_current_review = current_review.is_some();
         let current_review = current_review.filter(|_| !checkout_in_progress);
